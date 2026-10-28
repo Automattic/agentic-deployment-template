@@ -150,7 +150,10 @@ jobs:
               title, body, labels: ['template-drift'],
             });
 
-      - name: Say what could not be checked
+      # Fail rather than warn. A green run here reads as "the copies agree", and
+      # when the customer copy is unreachable nothing was compared at all.
+      - name: Fail when the customer copy could not be checked
         if: steps.fetch.outputs.reachable == 'false'
         run: |
-          echo "::warning::Could not reach the customer copy, so drift was not verified this run."
+          echo "::error::Could not reach the customer copy, so drift was not verified this run."
+          exit 1
