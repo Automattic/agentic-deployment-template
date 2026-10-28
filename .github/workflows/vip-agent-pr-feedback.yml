@@ -1,0 +1,364 @@
+# vip-template-version: 2
+# Lets a human revise an open pull request by commenting "@vip-agent <instruction>",
+# for the providers that only edit files (openai-codex and gemini). Claude has its
+# own loop, vip-claude-pr-feedback.yml, which answers "@claude" and is unchanged.
+#
+# Why "@vip-agent": "@codex" summons Codex cloud's GitHub integration, "/gemini"
+# summons Gemini Code Assist, and Google's own examples use "@gemini-cli". A phrase
+# none of them listens for cannot start two agents for one comment.
+#
+# Why issue_comment only: an issue_comment run uses this workflow as it is on the
+# default branch. pull_request_review and pull_request_review_comment runs use the
+# PR's merge ref, which the PR's author controls. So "@vip-agent" in an inline
+# review comment does nothing; comment on the PR's conversation tab instead.
+#
+# The agent edits a checkout of the PR head; vip-agent-publish.yml validates the
+# change and pushes it to the head branch as a plain fast-forward. It never
+# force-pushes, and it refuses forks, the default branch and protected branches.
+
+name: VIP Agent PR Feedback
+
+on:
+  issue_comment:
+    types: [created]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # The same core tail as vip-agent-ready-trigger.yml. Security-critical rules
+  # stay in the prompt so a repository's own AGENTS.md cannot remove them.
+  VIP_PROMPT_CORE: |
+    WRITING GITHUB ACTIONS WORKFLOW FILES:
+
+    Write every run: as a block scalar (run: |) by default. In a plain
+    run: line, a colon followed by a space is parsed as a mapping and the
+    whole file stops being valid YAML. Quoting does not save you — the
+    outer scalar is still plain:
+
+        run: echo $(( x > 0 ? 1 : 0 ))     # breaks
+        run: git commit -m "fix: thing"    # breaks too
+
+        run: |                             # fine
+          git commit -m "fix: thing"
+
+    GitHub cannot schedule a job from a file it could not read, so the
+    run ends in seconds with no jobs and no log. That reads as broken
+    code rather than broken YAML.
+
+    If this repository depends on code you cannot read from here — a private
+    dependency, an API you cannot reach — do NOT guess its contract. Do what you
+    can, and state the unverified assumption plainly where a reviewer will read
+    it: in the plan when planning, in the PR body when implementing. A confident
+    change built on a guessed interface passes review and fails in production.
+
+# One run at a time per pull request, whole run included: a second "@vip-agent"
+# must not read the PR head until the first run's publish has pushed, or it
+# starts from a commit that is about to be replaced and ends in "branch moved".
+# Every comment on every issue and PR starts this workflow, so only a
+# "@vip-agent" comment on a PR joins the PR's group; any other comment gets a
+# group of its own and can never displace a pending request. GitHub keeps one
+# pending run per group, so a third request made while one runs and one waits
+# replaces the waiting one.
+concurrency:
+  group: ${{ github.event.issue.pull_request && startsWith(github.event.comment.body, '@vip-agent') && format('vip-agent-pr-feedback-{0}', github.event.issue.number) || format('vip-agent-pr-feedback-other-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # PREFLIGHT
+  # ─────────────────────────────────────────────────────────────────────────────
+  preflight:
+    if: |
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, '@vip-agent') &&
+      contains(fromJSON('["openai-codex", "gemini"]'), vars.AGENT_PROVIDER)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      head_ref: ${{ steps.check.outputs.head_ref }}
+      head_sha: ${{ steps.check.outputs.head_sha }}
+      context: ${{ steps.check.outputs.context }}
+
+    steps:
+      # Before any checkout: who asked, and is this a branch the agent may push to.
+      - name: Check the request
+        id: check
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const n = context.payload.issue.number;
+            const commenter = context.payload.comment.user.login;
+            const refuse = async (why) => {
+              await github.rest.issues.createComment({ owner, repo, issue_number: n,
+                body: `@${commenter} ${why} No agent was started.` });
+              core.setOutput('proceed', 'false');
+            };
+            const level = async (user) => {
+              try {
+                return (await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: user })).data.permission;
+              } catch { return 'none'; }
+            };
+
+            if (!['write', 'admin'].includes(await level(commenter))) {
+              return refuse('Only collaborators with write access can ask the agent to change a pull request.');
+            }
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: n });
+            if (pr.state !== 'open') return refuse('This pull request is not open.');
+            if (pr.head.repo?.full_name !== `${owner}/${repo}`) {
+              return refuse('This pull request comes from a fork. The agent only pushes to branches in this repository.');
+            }
+            if (pr.head.ref === context.payload.repository.default_branch) {
+              return refuse(`The head branch is \`${pr.head.ref}\`, the default branch. The agent never pushes to it.`);
+            }
+            const { data: branch } = await github.rest.repos.getBranch({ owner, repo, branch: pr.head.ref });
+            if (branch.protected) {
+              return refuse(`\`${pr.head.ref}\` is a protected branch. The agent never pushes to one.`);
+            }
+
+            // What reaches the agent: the request, and text written by people
+            // with write access. A PR description from anyone else could carry
+            // instructions the requester never saw.
+            const request = context.payload.comment.body.replace(/^@vip-agent\b[:,]?\s*/, '');
+            const authorTrusted = ['write', 'admin'].includes(await level(pr.user.login));
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: n, per_page: 100 });
+            let diff = '';
+            for (const f of files) {
+              const part = `--- ${f.filename} (${f.status}, +${f.additions} -${f.deletions})\n${f.patch || '(no textual diff)'}\n`;
+              if (diff.length + part.length > 40000) { diff += `... ${files.length} files in total; the rest is not shown.\n`; break; }
+              diff += part;
+            }
+            const fence = t => '~~~~text\n' + String(t).replace(/~~~~/g, '~ ~~~') + '\n~~~~';
+            const ctx = [
+              `You are addressing review feedback on pull request #${n} ("${pr.title.replace(/\n/g, ' ')}"),`,
+              `branch ${pr.head.ref}. The workspace is a checkout of that branch.`,
+              '',
+              `${commenter}, who has write access, asked for this:`,
+              fence(request),
+              '',
+              ...(authorTrusted && pr.body ? ['The pull request description:', fence(pr.body), ''] : []),
+              'What the pull request changes so far:',
+              fence(diff || '(no files)'),
+              '',
+              'Make the requested change on top of the branch as it is. Change nothing else.',
+            ].join('\n');
+
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('context', ctx);
+            core.setOutput('proceed', 'true');
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # OPENAI CODEX
+  # The order matters: the setup action is read from the default branch's
+  # checkout, then the PR head replaces the workspace, then the agent runs.
+  # ─────────────────────────────────────────────────────────────────────────────
+  codex-agent:
+    needs: preflight
+    if: needs.preflight.outputs.proceed == 'true' && vars.AGENT_PROVIDER == 'openai-codex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare the Codex run
+        id: setup
+        uses: ./.github/actions/vip-codex-run
+        with:
+          mode: feedback
+          context: ${{ needs.preflight.outputs.context }}
+          tail: ${{ env.VIP_PROMPT_CORE }}
+
+      - name: Checkout the pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.head_sha }}
+          persist-credentials: false
+
+      - name: Remove repository agent settings and env files
+        run: |
+          find . -path ./.git -prune -o \( -name '.env*' -o -name .codex -o -name .agents -o -name .gemini \) -prune -print0 \
+            | xargs -0 -r rm -rf --
+
+      - name: Codex
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          codex-version: '0.163.0'
+          codex-home: ${{ steps.setup.outputs.codex_home }}
+          prompt-file: ${{ steps.setup.outputs.prompt_file }}
+          output-file: ${{ steps.setup.outputs.final_message_file }}
+          permission-profile: ':workspace'
+          safety-strategy: drop-sudo
+
+      - name: Snapshot the workspace
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin HOME=/tmp /usr/bin/bash --noprofile --norc -eo pipefail {0}
+        run: |
+          out='${{ runner.temp }}/vip-agent-out'
+          mkdir -p "$out"
+          tar --anchored --exclude=./.git -C '${{ github.workspace }}' -czf "$out/snapshot.tgz" .
+          rm -rf '${{ github.workspace }}/.git'
+
+      - name: Upload the snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vip-agent-snapshot
+          path: ${{ runner.temp }}/vip-agent-out
+          retention-days: 1
+          # The snapshot is already gzipped.
+          compression-level: 0
+
+  codex-publish:
+    needs: [preflight, codex-agent]
+    if: always() && needs.preflight.outputs.proceed == 'true' && vars.AGENT_PROVIDER == 'openai-codex'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    uses: ./.github/workflows/vip-agent-publish.yml
+    with:
+      mode: feedback
+      provider: openai-codex
+      pr_number: ${{ format('{0}', github.event.issue.number) }}
+      head_ref: ${{ needs.preflight.outputs.head_ref }}
+      head_sha: ${{ needs.preflight.outputs.head_sha }}
+      agent_result: ${{ needs.codex-agent.result }}
+      agent_job: codex-agent
+    secrets:
+      publish_token: ${{ secrets.VIP_AGENT_PUBLISH_TOKEN }}
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # GEMINI
+  # ─────────────────────────────────────────────────────────────────────────────
+  gemini-agent:
+    needs: preflight
+    if: needs.preflight.outputs.proceed == 'true' && vars.AGENT_PROVIDER == 'gemini'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare the Gemini run
+        id: setup
+        uses: ./.github/actions/vip-gemini-run
+        with:
+          mode: feedback
+          context: ${{ needs.preflight.outputs.context }}
+          tail: ${{ env.VIP_PROMPT_CORE }}
+
+      # run-gemini-cli has no working-directory input, so the PR head goes at
+      # the workspace root.
+      - name: Checkout the pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.head_sha }}
+          persist-credentials: false
+
+      # A PR head can carry a .gemini/settings.json that enables a shell, or a
+      # .env that points the CLI elsewhere. Gemini trusts the workspace.
+      - name: Remove repository agent settings and env files
+        run: |
+          find . -path ./.git -prune -o \( -name '.env*' -o -name .codex -o -name .agents -o -name .gemini \) -prune -print0 \
+            | xargs -0 -r rm -rf --
+
+      - name: Gemini
+        uses: google-github-actions/run-gemini-cli@f77273f4c914e4bf38440cf36a0369cb64a37489 # v0.1.22
+        env:
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_cli_version: '0.65.0'
+          settings: ${{ steps.setup.outputs.settings }}
+          prompt: ${{ steps.setup.outputs.prompt }}
+
+      - name: Snapshot the workspace
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin HOME=/tmp /usr/bin/bash --noprofile --norc -eo pipefail {0}
+        run: |
+          w='${{ github.workspace }}'
+          out='${{ runner.temp }}/vip-agent-out'
+          mkdir -p "$out"
+          log="$w/gemini-artifacts/stdout.log"
+          if [[ -s "$log" ]]; then
+            jq -r '.response // ""' "$log" > "$out/final-message.md" 2>/dev/null || true
+            jq '{turns: ([.stats.models[]?.roles.main.totalRequests // 0] | add // 0),
+                 tokens: ([.stats.models[]?.tokens.total // 0] | add // 0),
+                 tool_failures: (.stats.tools.totalFail // 0)}' "$log" > "$out/metrics.json" 2>/dev/null || true
+          fi
+          tar --anchored --exclude=./.git --exclude=./gemini-artifacts -C "$w" -czf "$out/snapshot.tgz" .
+          rm -rf "$w/.git"
+
+      - name: Upload the snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vip-agent-snapshot
+          path: ${{ runner.temp }}/vip-agent-out
+          retention-days: 1
+          # The snapshot is already gzipped.
+          compression-level: 0
+
+  gemini-keyscan:
+    needs: [preflight, gemini-agent]
+    if: needs.gemini-agent.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      result: ${{ steps.scan.outputs.result }}
+    steps:
+      - name: Download the snapshot
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vip-agent-snapshot
+          path: ${{ runner.temp }}/scan
+
+      - name: Look for the key
+        id: scan
+        env:
+          KEY: ${{ secrets.GEMINI_API_KEY }}
+          DIR: ${{ runner.temp }}/scan
+        run: |
+          result=fail
+          if [[ -n "$KEY" ]]; then
+            hits="$( { zcat "$DIR/snapshot.tgz"; find "$DIR" -type f ! -name snapshot.tgz -exec cat {} +; } | grep -acF -- "$KEY" || true)"
+            [[ "$hits" == "0" ]] && result=pass
+          fi
+          echo "Key scan: $result"
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+
+  gemini-publish:
+    needs: [preflight, gemini-agent, gemini-keyscan]
+    if: always() && needs.preflight.outputs.proceed == 'true' && vars.AGENT_PROVIDER == 'gemini'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    uses: ./.github/workflows/vip-agent-publish.yml
+    with:
+      mode: feedback
+      provider: gemini
+      pr_number: ${{ format('{0}', github.event.issue.number) }}
+      head_ref: ${{ needs.preflight.outputs.head_ref }}
+      head_sha: ${{ needs.preflight.outputs.head_sha }}
+      agent_result: ${{ needs.gemini-agent.result }}
+      agent_job: gemini-agent
+      key_scan_result: ${{ needs.gemini-keyscan.outputs.result || needs.gemini-keyscan.result }}
+    secrets:
+      publish_token: ${{ secrets.VIP_AGENT_PUBLISH_TOKEN }}

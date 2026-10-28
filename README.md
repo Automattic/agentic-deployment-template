@@ -1,6 +1,6 @@
 # Agentic Deployment Template
 
-A GitHub template repository that brings structured, agent-assisted development to any codebase. Drop it into your repository to get issue templates, automated labeling, and AI agent workflows that route to **Claude Code**, **OpenAI Codex**, **GitHub Copilot**, or a **custom agent** — all configured with a single repository variable.
+A GitHub template repository that brings structured, agent-assisted development to any codebase. Drop it into your repository to get issue templates, automated labeling, and AI agent workflows that route to **Claude Code**, **OpenAI Codex**, **Gemini**, **GitHub Copilot**, or a **custom agent** — all configured with a single repository variable.
 
 Built on the workflow developed at [Pew Research Center](https://pewresearch.org) and generalized for any team.
 
@@ -11,10 +11,12 @@ Built on the workflow developed at [Pew Research Center](https://pewresearch.org
 1. A developer opens an issue using the **Agent-Ready template**
 2. When the issue has all the required sections, the auto-labeler flags it `vip-agent-candidate` — a hint that it looks ready
 3. A human adds `vip-agent-ready` (or re-applies it), and the trigger workflow routes to your configured AI agent
-4. The agent implements the feature and opens a PR
+4. The agent implements the feature and a PR is opened — by Claude itself, or, for Codex and Gemini, by a separate trusted job that checks the agent's changes first
 5. A human reviews and merges
 
-For `vip-complexity:high` issues, Claude + Compound Engineering runs a planning phase first — generating a structured implementation plan that a human approves before any code is written.
+For `vip-complexity:high` issues, the agent runs a planning phase first — writing a structured implementation plan that a human approves with `/approve-plan` before any code is written.
+
+Every agent reads `AGENTS.md` at the repository root for project guidance. Edit it: it is where your conventions, test commands and definition of done go.
 
 ---
 
@@ -59,12 +61,13 @@ Actions → VIP Setup Labels → Run workflow
 
 | Value | Status | Required secret | Also needs |
 |-------|--------|-----------------|------------|
-| `claude` (default) | Implemented | `CLAUDE_CODE_OAUTH_TOKEN` | the Claude GitHub App, recommended — Step 4 |
-| `openai-codex` | **Not implemented** — stub job | `OPENAI_API_KEY`, once you write the job | — |
+| `claude` (default) | Implemented | `CLAUDE_CODE_OAUTH_TOKEN` | the Claude GitHub App, recommended — Step 4b |
+| `openai-codex` | Implemented (Beta) — edits files; a trusted job opens the PR | `OPENAI_API_KEY` | the repository setting in Step 4a |
+| `gemini` | Implemented (Beta) — file tools only; a trusted job opens the PR | `GEMINI_API_KEY` | the repository setting in Step 4a |
 | `copilot` | **Not implemented** — stub job | _(gh-aw setup required — see docs)_ | — |
 | `custom` | `repository_dispatch` only | _(your own listener — see docs)_ | — |
 
-Only `claude` runs an agent today. The `openai-codex` and `copilot` jobs echo a message and exit; `custom` fires a `repository_dispatch` event that does nothing until you add a listener workflow in the same repo. Either way a repo configured for one of them installs cleanly and goes green while labelling an issue produces nothing. `setup.sh` says so when you pick one, and the run itself now fails rather than passing quietly.
+The `copilot` job echoes a message and exits; `custom` fires a `repository_dispatch` event that does nothing until you add a listener workflow in the same repo. A repo configured for either installs cleanly and goes green while labelling an issue produces nothing. `setup.sh` says so when you pick one, and the run itself fails rather than passing quietly. An unrecognised value comments on the issue with the valid ones and fails.
 
 If `AGENT_PROVIDER` is not set, the workflow defaults to `claude`.
 
@@ -72,9 +75,17 @@ If `AGENT_PROVIDER` is not set, the workflow defaults to `claude`.
 |---|---|
 | `AGENT_DEBUG=true` | Streams Claude's full message history into the job log. **Off by default on purpose** — the stream includes tool results, and job logs are visible to anyone who can read the repository. See [AGENTIC_DEVELOPMENT.md](docs/AGENTIC_DEVELOPMENT.md). |
 
-**The secret is yours to add.** Secrets are write-only, so no script can set one for you — `setup.sh` reports whether it is there and stops short of claiming you are done without it. This matters because nothing else complains: labels sync, CI goes green, and the repo looks configured, but labelling an issue `vip-agent-ready` will not start the agent. Add it with `gh secret set CLAUDE_CODE_OAUTH_TOKEN`, or at `Settings → Secrets and variables → Actions → Secrets`.
+**The secret is yours to add.** Secrets are write-only, so no script can set one for you — `setup.sh` reports whether it is there and stops short of claiming you are done without it. This matters because nothing else complains: labels sync, CI goes green, and the repo looks configured, but labelling an issue `vip-agent-ready` will not start the agent. Add it with `gh secret set <NAME>` (for example `gh secret set GEMINI_API_KEY`), or at `Settings → Secrets and variables → Actions → Secrets`.
 
-**Step 4 — Install the Claude GitHub App** *(recommended, not required)*
+**Already installed an earlier version?** `setup.sh` never overwrites a file, so an existing install keeps its old workflows, which cannot run Codex or Gemini. `setup.sh` refuses to switch such a repo to either provider. To upgrade, delete the `vip-*` workflows and `.github/actions/vip-*` (keep a copy of any allow-list edits you made in `vip-claude-run`), re-run `setup.sh`, and review the diff before committing.
+
+**Step 4a — Codex and Gemini: let workflows open pull requests**
+
+Turn on **Settings → Actions → General → Workflow permissions → "Allow GitHub Actions to create and approve pull requests"**. Without it the agent's branch is pushed but the PR cannot be opened, and the issue says so.
+
+The PR is opened with the repository's `GITHUB_TOKEN`. GitHub runs CI on a PR opened that way only after a maintainer approves each run. **That approval is a security gate, not friction:** approving runs agent-written code in CI with this repository's secrets, so read the diff first — dependency manifests and CI scripts especially. The same setting also lets workflows approve pull requests; require code-owner or team review in a ruleset if that matters here. (Which token opens agent PRs is still being decided — VIPPROD-1427. A `VIP_AGENT_PUBLISH_TOKEN` secret, if set, is used instead of `GITHUB_TOKEN`.)
+
+**Step 4b — Claude: install the Claude GitHub App** *(recommended, not required)*
 
 If you already use Claude Code in a terminal, run `/install-github-app` — it sets up the app and the secret together, and most people who have used Claude Code have already done this once.
 
@@ -82,11 +93,12 @@ Otherwise install it at **https://github.com/apps/claude** → **Configure** →
 
 **The agent runs without it.** `CLAUDE_CODE_OAUTH_TOKEN` on its own is enough to start a run. What the app changes is what happens to the pull requests the agent opens.
 
-`anthropics/claude-code-action` exchanges the workflow's OIDC token for a GitHub App installation token when the app is installed, and falls back to the workflow's own `GITHUB_TOKEN` when it is not. GitHub does not start workflow runs from events triggered by `GITHUB_TOKEN` — so without the app, the agent's pull request arrives with **no CI run on it**, and a PR your test suite never touched is a poor thing to hand a reviewer. That is the reason to install it.
+`anthropics/claude-code-action` exchanges the workflow's OIDC token for a GitHub App installation token when the app is installed, and falls back to the workflow's own `GITHUB_TOKEN` when it is not. GitHub runs CI on a pull request opened with `GITHUB_TOKEN` only after a maintainer approves each run — so without the app, the agent's pull request arrives with **CI waiting on you**, and a PR your test suite has not touched is a poor thing to hand a reviewer. That is the reason to install it.
 
 The same applies to `vip-claude-pr-feedback.yml` and `vip-plan-approval-gate.yml`, which use the same action.
 
 **Step 5 — Open an agent-ready issue**
+
 Use the **Agent-Ready Task** issue template. Fill in all sections, add a `vip-complexity:` label, then **add `vip-agent-ready` yourself** — that label is what starts the agent.
 
 The auto-labeler does not apply `vip-agent-ready` and cannot start a run. It applies `vip-agent-candidate` to issues that have the right shape — a review hint. Only `vip-agent-ready`, applied by a person, starts the agent.
@@ -97,9 +109,27 @@ The auto-labeler does not apply `vip-agent-ready` and cannot start a run. It app
 
 Add the complexity label **before** `vip-agent-ready`, and this order matters. Only the `vip-agent-ready` label starts a run, and the trigger then reads the issue's full label set from the API — so a `vip-complexity:high` issue that gains its complexity label *after* `vip-agent-ready` has already fired will have taken the direct path and skipped planning.
 
+### How Codex and Gemini run
+
+Codex and Gemini only edit files. Neither can commit, push or open a pull request, and neither holds a token that could. When the agent finishes, its workspace is handed as a snapshot to `vip-agent-publish.yml`, a separate job that never sees a model key. That job:
+
+- **rejects the whole snapshot** if it contains a new or retargeted symlink, a hardlink or other special file, any `.git` path, a `.gitmodules` change, the provider's API key, or changed content over 50 MB per file, 100 MB in total or 5,000 files;
+- **leaves out, and lists,** changes to `.github/`, `.claude/`, `CODEOWNERS`, `.gitattributes`, `.env*`, `scripts/setup.sh`, `scripts/vip-*` and agent settings directories;
+- **flags in the PR body** changes to `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` and developer-tool configuration;
+- commits with hooks off and pushes without force. Repositories whose rulesets require signed commits reject these commits — a known limitation.
+
+What bounds each agent while it runs:
+
+- **Codex** runs in `openai/codex-action`'s `:workspace` sandbox with sudo dropped. It can write the workspace and `/tmp`; `.git`, `$RUNNER_TEMP` and `$GITHUB_ENV` are read-only, the network is off, and `OPENAI_API_KEY` never enters its environment. Command rules forbid `curl`, `git push` and similar, but they match only a command Codex runs directly, not one inside a script — the sandbox is the guarantee, not the rules.
+- **Gemini** has file tools only: no shell, no web fetch, no search. Gemini CLI cannot be kept off the network and holds its own key, so it gets no tool that could reach either; the CLI also refuses paths outside the workspace and writes into `.git`. A separate job scans its output for the key's literal value before anything is published. Turning on [push protection](https://docs.github.com/en/code-security/secret-scanning/introduction/about-push-protection) is a good backstop.
+
+Both agents read `AGENTS.md`. The safety rules are in the workflow prompts, so a repository's own `AGENTS.md` cannot remove them.
+
+**Revising a PR:** comment `@vip-agent <what to change>` on the pull request's conversation tab. Only collaborators with write access can; fork PRs, the default branch and protected branches are refused; the fix is pushed as a normal commit, never forced. `@vip-agent` in an inline review comment does nothing. Claude keeps answering `@claude` as before.
+
 ### Workflow and permission guard
 
-`scripts/vip-validate-workflows.sh` does two things, and CI runs it on any PR touching a workflow.
+`scripts/vip-validate-workflows.sh` does several things, and CI runs it on any PR touching a workflow, a composite action or `.claude/`.
 
 **It parses every workflow file.** A file that doesn't parse fails quietly — GitHub can't schedule a job from something it couldn't read, so the run ends in seconds with no jobs and no log, which reads as broken code rather than broken YAML. The usual cause is a colon-space in a plain `run:` line, and quoting doesn't help:
 
@@ -115,6 +145,8 @@ run: |                             # fine — a colon is just a character
 
 This exists because those lists are hand-maintained across four call sites, a widened one looks identical in a green build, and the comments beside them are advisory text a hurried editor reads past. `git` and `gh` are deliberately absent from the denylist — the agent cannot commit or open a PR without them, which is documented in [AGENTIC_DEVELOPMENT.md](docs/AGENTIC_DEVELOPMENT.md).
 
+**It holds each provider's guardrails.** Codex must run with `permission-profile: ":workspace"` and dropped sudo, with no `allow` rule; Gemini's `tools.core` must exclude the shell and web tools, and a Gemini step whose settings it cannot find fails the check rather than passing it. Agent jobs must keep the 30-minute timeout, the publish workflow must not paste expressions into code, every `uses: ./…` target must exist, and no workflow may approve a pull request.
+
 Run it yourself any time:
 
 ```bash
@@ -127,8 +159,9 @@ bash scripts/vip-validate-workflows.sh
 
 | Provider | Status | Notes |
 |----------|--------|-------|
-| **Claude + Compound Engineering** | Implemented | Complexity-aware: high issues plan first, low/medium execute directly |
-| **OpenAI Codex** | **Not implemented** — stub job | Write `trigger-openai-codex` in `.github/workflows/vip-agent-ready-trigger.yml` |
+| **Claude + Compound Engineering** | Implemented | Complexity-aware: high issues plan first, low/medium execute directly. Revise a PR with `@claude`. |
+| **OpenAI Codex** | Implemented (Beta) | `openai/codex-action`, sandboxed and edit-only; `vip-agent-publish.yml` opens the PR. Revise with `@vip-agent`. Cost and turns are not reported. |
+| **Gemini** | Implemented (Beta) | `google-github-actions/run-gemini-cli`, file tools only; output key-scanned, then published. Revise with `@vip-agent`. Reports turns and tokens, not cost. |
 | **GitHub Copilot (gh-aw)** | **Not implemented** — stub job | Write `trigger-copilot`; requires `gh aw compile` setup |
 | **Custom** | `repository_dispatch` only | Dispatches the issue payload; wire your own listener in the same repo |
 
@@ -145,15 +178,25 @@ bash scripts/vip-validate-workflows.sh
 ├── vip-agent-labels.yml                  # 7 labels for the agent workflow
 ├── agents/
 │   └── vip-issue-screener.agent.md # Claude-powered issue screener (opt-in)
+├── actions/
+│   ├── vip-agent-preflight/        # Who labelled it, labels, structure, open PRs — every provider
+│   ├── vip-claude-run/             # Claude's invocation and allow list
+│   ├── vip-codex-run/              # Codex setup: command rules and prompt
+│   ├── vip-gemini-run/             # Gemini setup: file-only tools and prompt
+│   └── vip-screen-issue/           # The structural issue check
 └── workflows/
     ├── vip-agent-ready-trigger.yml  # Core: routes labeled issues to your agent
     ├── vip-plan-approval-gate.yml   # /approve-plan comment listener (high complexity)
+    ├── vip-agent-publish.yml        # Validates and publishes Codex and Gemini changes
+    ├── vip-agent-pr-feedback.yml    # @vip-agent on a PR (Codex, Gemini)
+    ├── vip-claude-pr-feedback.yml   # @claude on a PR (Claude)
     ├── vip-setup-labels.yml         # One-time label import
     ├── vip-auto-label-agent-ready.yml # Flags complete issues vip-agent-candidate
     ├── vip-issue-screener.yml       # Weekly screener for unscreened issues
-    └── vip-validate-workflows.yml   # Fails a PR whose workflow YAML or allow list is bad
+    └── vip-validate-workflows.yml   # Fails a PR whose workflow YAML or guardrails are bad
 scripts/
 └── vip-validate-workflows.sh       # The check behind that — also run by the agent
+AGENTS.md                           # Project guidance every agent reads — edit it
 ```
 
 ---
@@ -181,7 +224,7 @@ When `AGENT_PROVIDER=claude`, the trigger workflow uses **Compound Engineering**
 
 This gives you human-in-the-loop oversight for architectural work while keeping simple tasks fully automated.
 
-> Compound Engineering is a Claude Code plugin. Other providers use equivalent plain-language prompts without the CE skill layer.
+> Compound Engineering is a Claude Code plugin. Codex and Gemini get equivalent plain-language prompts without the CE skill layer, and follow the same plan → `/approve-plan` → PR flow.
 
 ---
 
@@ -198,7 +241,7 @@ This gives you human-in-the-loop oversight for architectural work while keeping 
 
 **Add CI checks** — create your own `.github/workflows/ci.yml` with stack-specific linting and tests. The template intentionally omits this (too stack-specific).
 
-**Extend a stub provider** — find the `# TODO: extend for [provider]` comment in `vip-agent-ready-trigger.yml` and add your invocation steps.
+**Extend the Copilot stub** — find the `# TODO` comments in the `trigger-copilot` job in `vip-agent-ready-trigger.yml` and add your invocation steps.
 
 ---
 
