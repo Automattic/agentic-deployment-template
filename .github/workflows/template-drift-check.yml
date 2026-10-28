@@ -89,7 +89,7 @@ jobs:
           # Everything a customer repo receives. docs/ and the plan directory
           # are deliberately excluded: they are prose, they drift for good
           # reasons, and a diff there is noise rather than signal.
-          paths=(.github .claude scripts README.md)
+          paths=(.github .claude scripts README.md AGENTS.md)
 
           # diff needs pairs; do it per path so a missing directory on one side
           # is reported rather than aborting the run.

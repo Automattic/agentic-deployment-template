@@ -28,6 +28,9 @@
 #   - Adds scripts/vip-validate-workflows.sh  (the workflow YAML + permission guard)
 #   - Adds .github/actions/vip-claude-run/       (the shared agent invocation)
 #   - Adds .github/actions/vip-screen-issue/     (the shared issue structure check)
+#   - Adds .github/actions/vip-agent-preflight/  (the checks every provider runs first)
+#   - Adds .github/actions/vip-codex-run/ and vip-gemini-run/  (provider setup, before the agent)
+#   - Adds AGENTS.md  (the instructions every agent reads; kept if you have one)
 #   - Creates docs/ if it doesn't exist
 #   - Sets the AGENT_PROVIDER repository variable, and reports on the secret
 #   - Prints next steps
@@ -177,6 +180,7 @@ WORKFLOW_FILES=(
   ".github/workflows/vip-issue-screener.yml"
   ".github/workflows/vip-validate-workflows.yml"
   ".github/workflows/vip-claude-pr-feedback.yml"
+  ".github/workflows/vip-agent-publish.yml"
 )
 
 for file in "${WORKFLOW_FILES[@]}"; do
@@ -205,7 +209,7 @@ fi
 # startup — so this is not optional and is installed even if it already exists
 # in some other form.
 
-for action in vip-claude-run vip-screen-issue; do
+for action in vip-agent-preflight vip-claude-run vip-codex-run vip-gemini-run vip-screen-issue; do
   if [[ -f ".github/actions/$action/action.yml" ]]; then
     yellow "  skipped (already exists): .github/actions/$action/action.yml"
   else
@@ -226,6 +230,20 @@ else
   fetch "scripts/vip-validate-workflows.sh" "scripts/vip-validate-workflows.sh"
   chmod +x "scripts/vip-validate-workflows.sh"
   green "  added: scripts/vip-validate-workflows.sh"
+fi
+
+# ── AGENTS.md ─────────────────────────────────────────────────────────────────
+# The instruction file every provider reads: Codex and Gemini natively, Claude
+# because its prompts name it. Yours wins if you have one — the safety rules
+# live in the workflow prompts, not here, so nothing is lost by keeping it.
+
+if [[ -f "AGENTS.md" ]]; then
+  yellow "  kept (already exists): AGENTS.md"
+  echo   "  → The agents will follow your AGENTS.md. Compare it with the template's to"
+  echo   "    see whether it covers test commands and what \"done\" means: $DOCS_URL/blob/main/AGENTS.md"
+else
+  fetch "AGENTS.md" "AGENTS.md"
+  green "  added: AGENTS.md  (edit it: it is your project's guidance for every agent)"
 fi
 
 # ── docs/ directory ───────────────────────────────────────────────────────────
@@ -388,7 +406,7 @@ echo "  1. Review added files:"
 echo "     git status"
 echo ""
 echo "  2. Commit:"
-echo "     git add .github/ docs/"
+echo "     git add .github/ docs/ scripts/ AGENTS.md"
 echo "     git commit -m 'chore: add agentic deployment template'"
 echo "     git push"
 echo ""

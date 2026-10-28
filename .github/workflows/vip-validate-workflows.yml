@@ -1,3 +1,4 @@
+# vip-template-version: 2
 # Parses every file in .github/workflows/ on any PR that touches one.
 #
 # The agent is instructed to run scripts/vip-validate-workflows.sh before opening a
@@ -10,9 +11,15 @@ name: VIP Validate Workflows
 
 on:
   pull_request:
+    # The allow lists and guards live in composite actions and .claude/ as well
+    # as in workflows. A path filter that missed them let a widened allow list
+    # merge without the check ever running.
     paths:
       - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.claude/**'
       - 'scripts/vip-validate-workflows.sh'
+      - 'scripts/tests/**'
 
 permissions:
   contents: read
@@ -28,3 +35,12 @@ jobs:
 
       - name: Parse every workflow file
         run: bash scripts/vip-validate-workflows.sh
+
+      # Only in the template repository: setup.sh does not install the tests.
+      # Each guardrail check is proven by a mutation that must make it fail, and
+      # the publish workflow's snapshot validation by hand-made hostile snapshots.
+      - name: Test the validator and the publish checks
+        if: hashFiles('scripts/tests/test-vip-validate-workflows.sh') != ''
+        run: |
+          bash scripts/tests/test-vip-validate-workflows.sh
+          bash scripts/tests/test-vip-agent-publish.sh

@@ -1,0 +1,787 @@
+# vip-template-version: 2
+# Turns an edit-only agent's workspace snapshot into a pull request, a plan
+# branch, or a commit on a PR's head branch. Called by the trigger, the plan
+# gate and vip-agent-pr-feedback.yml for every provider except Claude.
+#
+# Why a separate, trusted job
+#
+# Codex's sandbox makes .git read-only and turns the network off, so the agent
+# cannot commit or push. Gemini keeps its API key in the agent's environment and
+# cannot be kept off the network. Either way the agent must not hold a token
+# that can write to the repository. So the agent job only edits files and
+# uploads a snapshot; this job, which never sees a model API key, decides what
+# of that snapshot may be published and publishes it.
+#
+# A reusable workflow, not a composite action: a local workflow reference
+# resolves at the caller's commit (the default branch, for every event that
+# calls this), so an agent cannot rewrite what runs here. A local action would
+# be read from the workspace when its step starts.
+#
+# Everything that came out of the agent job is untrusted: the snapshot, the
+# final message, the metrics. It reaches code only through env:, never through
+# an expression inside run: or script:. scripts/vip-validate-workflows.sh
+# enforces that for this file.
+#
+# What the agent job must do, inline, after its agent step (no local actions,
+# no secrets, no git — the job is treated as compromised from that point):
+#
+#   - name: Snapshot the workspace
+#     shell: /usr/bin/env -i PATH=/usr/bin:/bin HOME=/tmp /usr/bin/bash --noprofile --norc -eo pipefail {0}
+#     run: |
+#       out='${{ runner.temp }}/vip-agent-out'
+#       mkdir -p "$out"
+#       tar --anchored --exclude=./.git -C '${{ github.workspace }}' -czf "$out/snapshot.tgz" .
+#       rm -rf '${{ github.workspace }}/.git'
+#   - uses: actions/upload-artifact@<sha>  # name: vip-agent-snapshot, path: the out dir, retention-days: 1
+#
+# The out dir may also hold final-message.md and metrics.json; both optional.
+
+name: VIP Agent Publish
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "implement, plan or feedback"
+        type: string
+        required: true
+      provider:
+        description: "openai-codex or gemini"
+        type: string
+        required: true
+      issue_number:
+        description: "The issue (implement and plan modes)."
+        type: string
+        default: ""
+      base_sha:
+        description: "The commit the agent started from (implement and plan modes)."
+        type: string
+        default: ""
+      pr_number:
+        description: "The pull request (feedback mode)."
+        type: string
+        default: ""
+      head_ref:
+        description: "The PR's head branch (feedback mode)."
+        type: string
+        default: ""
+      head_sha:
+        description: "The PR head the agent started from (feedback mode)."
+        type: string
+        default: ""
+      plan_path:
+        description: "After /approve-plan: the plan file staged into the workspace before the agent ran."
+        type: string
+        default: ""
+      agent_result:
+        description: "needs.<agent job>.result"
+        type: string
+        required: true
+      agent_job:
+        description: "The agent job's name as the jobs API reports it, for timing."
+        type: string
+        required: true
+      agent_timeout_minutes:
+        type: number
+        default: 30
+      key_scan_result:
+        description: "pass or fail from the key-scan job, or that job's result when it produced none. Gemini publishes only on pass."
+        type: string
+        default: "n/a"
+      artifact:
+        type: string
+        default: vip-agent-snapshot
+    secrets:
+      publish_token:
+        description: "Token used to push and open the PR. Defaults to GITHUB_TOKEN (VIPPROD-1427)."
+        required: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  publish:
+    # A skipped agent job means preflight refused, and preflight already said why.
+    if: inputs.agent_result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MODE: ${{ inputs.mode }}
+      PROVIDER: ${{ inputs.provider }}
+      ISSUE: ${{ inputs.issue_number }}
+      BASE_SHA: ${{ inputs.base_sha }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      HEAD_REF: ${{ inputs.head_ref }}
+      HEAD_SHA: ${{ inputs.head_sha }}
+      PLAN_PATH: ${{ inputs.plan_path }}
+      AGENT_RESULT: ${{ inputs.agent_result }}
+      AGENT_JOB: ${{ inputs.agent_job }}
+      AGENT_TIMEOUT: ${{ inputs.agent_timeout_minutes }}
+      KEY_SCAN: ${{ inputs.key_scan_result }}
+
+    steps:
+      - name: Prepare
+        run: echo "WORK=$RUNNER_TEMP/vip-publish" >> "$GITHUB_ENV"
+
+      # ── Failed or timed-out agent ──────────────────────────────────────────
+      # A `needs` result cannot tell a timeout from any other failure: a job
+      # stopped at timeout-minutes reports `cancelled`, as does one a human
+      # cancelled. How long it ran can. Measured: 90 s for a 1-minute timeout,
+      # 5 s for a fast failure.
+      - name: Report a failed or timed-out agent
+        if: inputs.agent_result != 'success'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const target = Number(process.env.MODE === 'feedback' ? process.env.PR_NUMBER : process.env.ISSUE);
+            const limit = Number(process.env.AGENT_TIMEOUT) * 60;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+              owner, repo, run_id: context.runId, attempt_number: context.runAttempt, per_page: 100,
+            });
+            const agent = jobs.find(j => j.name === process.env.AGENT_JOB);
+            let seconds = 0;
+            if (agent?.started_at && agent?.completed_at) {
+              seconds = (Date.parse(agent.completed_at) - Date.parse(agent.started_at)) / 1000;
+            }
+            // A little slack: the runner reports the stop a few seconds either side.
+            const timedOut = seconds >= limit - 30;
+            console.log(`Agent job "${process.env.AGENT_JOB}": ${process.env.AGENT_RESULT} after ${seconds}s (limit ${limit}s) — timeout: ${timedOut}`);
+
+            const setup = {
+              'openai-codex': [
+                '- **Required:** the `OPENAI_API_KEY` secret — **Settings → Secrets and variables → Actions → Secrets**.',
+                '- An `insufficient_quota` or `401` error in the log is the key\'s billing or validity, not this repository.',
+              ],
+              'gemini': [
+                '- **Required:** the `GEMINI_API_KEY` secret — **Settings → Secrets and variables → Actions → Secrets**.',
+                '- A `402` or `RESOURCE_EXHAUSTED` error in the log means the key\'s Google AI Studio project is out of credits.',
+              ],
+            }[process.env.PROVIDER] || [];
+
+            const lines = timedOut ? [
+              `⏱️ **The agent run stopped at its ${limit / 60}-minute limit**`,
+              '',
+              `Nothing was published. The [job log](${runUrl}) shows how far it got.`,
+              '',
+              'A run that is close to finishing usually needs a smaller issue rather than a',
+              'longer limit: split the acceptance criteria and label each part.',
+            ] : [
+              '⚠️ **The agent run failed**',
+              '',
+              `Nothing was published. The failing step and its error are in the [job log](${runUrl}) — start there.`,
+              '',
+              `Check the \`${process.env.PROVIDER}\` provider setup:`,
+              '',
+              ...setup,
+            ];
+
+            const MARKER = '<!-- agentic-workflow:failure-report -->';
+            const body = [MARKER, ...lines].join('\n');
+            const { data: existing } = await github.rest.issues.listComments({ owner, repo, issue_number: target, per_page: 100 });
+            const mine = existing.find(c => c.body && c.body.includes(MARKER));
+            if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            else await github.rest.issues.createComment({ owner, repo, issue_number: target, body });
+            core.setFailed(timedOut ? 'The agent job timed out.' : `The agent job ended: ${process.env.AGENT_RESULT}.`);
+
+      # ── Validate ────────────────────────────────────────────────────────────
+      - name: Download the snapshot
+        if: inputs.agent_result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact }}
+          path: ${{ runner.temp }}/vip-publish/in
+
+      # The commit the agent started from. persist-credentials: false — the
+      # token is handed to the push command alone, further down.
+      - name: Check out the starting commit
+        if: inputs.agent_result == 'success'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.mode == 'feedback' && inputs.head_sha || inputs.base_sha }}
+          path: repo
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Applies R11 itself, ignoring anything the agent side said about the
+      # snapshot. Reads the tar with tarfile and never extracts a link: a
+      # symlink that is new or points somewhere new rejects the snapshot, and
+      # an unchanged one is skipped. Regular files are compared with the
+      # checkout byte for byte; only the changed ones are staged.
+      - name: Validate the snapshot
+        id: validate
+        if: inputs.agent_result == 'success'
+        run: |
+          mkdir -p "$WORK/out" "$WORK/staging"
+          python3 -I - "$WORK/in/snapshot.tgz" "$GITHUB_WORKSPACE/repo" "$WORK/staging" "$WORK/out" <<'PY'
+          import os, sys, shutil, tarfile, subprocess, fnmatch, posixpath
+
+          tgz, repo, staging, out = sys.argv[1:5]
+          mode = os.environ["MODE"]
+          plan_path = os.environ.get("PLAN_PATH", "").strip().lstrip("./")
+          key_scan = os.environ.get("KEY_SCAN", "n/a")
+
+          FILE_CAP, TOTAL_CAP, COUNT_CAP = 50 * 2**20, 100 * 2**20, 5000
+
+          REFUSED_DIRS = (".github/", ".claude/", ".codex/", ".gemini/", ".agents/", "gemini-artifacts/")
+          REFUSED_EXACT = {"CODEOWNERS", "docs/CODEOWNERS", "scripts/setup.sh"}
+          FLAG_NAMES = {"AGENTS.md", "CLAUDE.md", "GEMINI.md", ".npmrc", ".yarnrc.yml", ".pnpmfile.cjs"}
+          FLAG_DIRS = (".vscode/", ".devcontainer/", ".husky/", ".githooks/")
+
+          def refused(p):
+              base = posixpath.basename(p)
+              return (p.startswith(REFUSED_DIRS) or p in REFUSED_EXACT
+                      or base == ".gitattributes" or base.startswith(".env")
+                      or fnmatch.fnmatch(p, "scripts/vip-*"))
+
+          def flagged(p):
+              return posixpath.basename(p) in FLAG_NAMES or any(f"/{d}" in f"/{p}" for d in FLAG_DIRS)
+
+          def finish(verdict, reason="", **lists):
+              if verdict == "reject":
+                  shutil.rmtree(staging, ignore_errors=True)
+                  os.makedirs(staging, exist_ok=True)
+              for name, items in lists.items():
+                  with open(os.path.join(out, f"{name}.txt"), "w") as fh:
+                      fh.write("".join(f"{i}\n" for i in sorted(items)))
+              with open(os.path.join(out, "verdict"), "w") as fh:
+                  fh.write(verdict)
+              with open(os.path.join(out, "reason"), "w") as fh:
+                  fh.write(reason)
+              print(f"verdict={verdict} {reason}")
+              sys.exit(0)
+
+          if key_scan == "fail":
+              finish("reject", "the provider's API key was found in the agent's output")
+          # Gemini holds its own key, so its output is published only after a scan
+          # that passed. Anything else (skipped, failed, missing) is not a pass.
+          if os.environ.get("PROVIDER") == "gemini" and key_scan != "pass":
+              finish("reject", "the key scan did not complete, so the output could not be checked for the provider's key")
+
+          def norm(name):
+              p = posixpath.normpath(name)
+              if p in (".", ""):
+                  return None
+              if p.startswith("/") or p == ".." or p.startswith("../"):
+                  finish("reject", f"a path escapes the workspace: {name!r}")
+              # File names are rendered into the PR body and passed to git one per
+              # line: control characters, backticks and a leading quote would break
+              # out of either.
+              if any(ord(c) < 32 or ord(c) == 127 for c in p) or "`" in p or p.startswith('"'):
+                  finish("reject", f"a file name contains a control character, a backtick or a leading quote: {name!r}")
+              return p
+
+          # The agent job deletes these before the agent runs, and the provider
+          # actions write their own settings and logs into them, so a change
+          # here says nothing about the agent. Leave them as they are, silently.
+          def scrubbed(p):
+              parts = p.split("/")
+              return (posixpath.basename(p).startswith(".env") or parts[0] == "gemini-artifacts"
+                      or any(x in (".codex", ".agents", ".gemini") for x in parts))
+
+          # Submodules (gitlinks, mode 160000) are not files: the snapshot holds at
+          # most an empty directory for one, which is not a deletion.
+          tracked = set()
+          for entry in subprocess.run(["git", "-C", repo, "ls-files", "-s", "-z"], capture_output=True,
+                                      check=True).stdout.decode().split("\0"):
+              if entry:
+                  meta, path = entry.split("\t", 1)
+                  if not meta.startswith("160000 "):
+                      tracked.add(path)
+
+          seen, changed, refused_paths, sizes = set(), [], set(), {}
+          with tarfile.open(tgz, "r:gz") as tar:
+              for m in tar:
+                  p = norm(m.name)
+                  if p is None:
+                      continue
+                  parts = p.split("/")
+                  if ".git" in parts:
+                      finish("reject", "the snapshot contains a .git path")
+                  if m.isdir():
+                      continue
+                  seen.add(p)
+                  here = os.path.join(repo, p)
+                  if m.issym():
+                      if os.path.islink(here) and os.readlink(here) == m.linkname:
+                          continue
+                      finish("reject", f"a symlink is new or points somewhere new: {p}")
+                  if not m.isreg():
+                      finish("reject", f"not a regular file (hardlink, FIFO or device): {p}")
+                  data = tar.extractfile(m).read()
+                  if os.path.isfile(here) and not os.path.islink(here) and os.path.getsize(here) == len(data):
+                      with open(here, "rb") as fh:
+                          if fh.read() == data:
+                              continue
+                  if posixpath.basename(p) == ".gitmodules":
+                      finish("reject", "the snapshot changes .gitmodules")
+                  if scrubbed(p):
+                      continue
+                  if refused(p):
+                      refused_paths.add(p)
+                      continue
+                  sizes[p] = len(data)
+                  dest = os.path.join(staging, p)
+                  os.makedirs(os.path.dirname(dest), exist_ok=True)
+                  with open(dest, "wb") as fh:
+                      fh.write(data)
+                  os.chmod(dest, 0o755 if m.mode & 0o111 else 0o644)
+                  changed.append(p)
+
+          deleted = []
+          for p in tracked - seen:
+              if scrubbed(p):
+                  continue
+              if refused(p):
+                  refused_paths.add(p)
+              else:
+                  deleted.append(p)
+
+          # Files git ignores are not part of the change, with one exception:
+          # plans live in docs/plans/, which repositories often ignore.
+          if changed:
+              ig = subprocess.run(["git", "-C", repo, "check-ignore", "--stdin", "-z"],
+                                  input="\0".join(changed).encode(), capture_output=True)
+              ignored = set(ig.stdout.decode().split("\0")) - {""}
+              keep = lambda p: p not in ignored or p.startswith("docs/plans/") or p == plan_path
+              changed = [p for p in changed if keep(p)]
+
+          # Caps apply to what would be committed, after ignored files drop out.
+          for p in changed:
+              if sizes[p] > FILE_CAP:
+                  finish("reject", f"a changed file is over 50 MB: {p}")
+          if sum(sizes[p] for p in changed) > TOTAL_CAP:
+              finish("reject", "changed content is over 100 MB in total")
+
+          if mode == "plan":
+              others = [p for p in changed + deleted if not p.startswith("docs/plans/")]
+              refused_paths.update(others)
+              changed = [p for p in changed if p.startswith("docs/plans/")]
+              deleted = []
+
+          if len(changed) + len(deleted) > COUNT_CAP:
+              finish("reject", "more than 5,000 files changed")
+
+          lists = dict(changed=changed, deleted=deleted, refused=refused_paths,
+                       flagged={p for p in changed + deleted if flagged(p)})
+          real = [p for p in changed + deleted if p != plan_path]
+          if mode == "plan" and not any(p.endswith(".md") for p in changed):
+              finish("nothing", "no plan file was written", **lists)
+          if not real:
+              finish("nothing", "the agent changed nothing", **lists)
+          finish("ok", **lists)
+          PY
+          echo "verdict=$(cat "$WORK/out/verdict")" >> "$GITHUB_OUTPUT"
+
+      # Preflight looked before the agent ran. A second /approve-plan, or a label
+      # re-applied mid-run, can have opened a PR since.
+      - name: Check for an existing agent PR
+        id: dupe
+        if: steps.validate.outputs.verdict == 'ok' && inputs.mode == 'implement'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const n = Number(process.env.ISSUE);
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100,
+            });
+            const existing = prs.find(pr =>
+              pr.body && new RegExp(`(closes|fixes|resolves)\\s+#${n}\\b`, 'i').test(pr.body));
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: n,
+                body: `Implementation is already in progress: ${existing.html_url}\n\nThis run's changes were not published.`,
+              });
+            }
+            core.setOutput('exists', existing ? 'true' : 'false');
+
+      # ── Apply and commit ─────────────────────────────────────────────────────
+      # Hooks off, fsmonitor off, no submodule recursion, no signing. Nothing in
+      # the snapshot can configure git here: .git paths were rejected above and
+      # this checkout's .git came from GitHub.
+      - name: Apply and commit
+        id: commit
+        if: steps.validate.outputs.verdict == 'ok' && steps.dupe.outputs.exists != 'true'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          g() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false \
+                    -c commit.gpgsign=false -c protocol.file.allow=never "$@"; }
+          g config user.name "github-actions[bot]"
+          g config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          case "$MODE" in
+            implement)
+              branch="agent/issue-${ISSUE}"
+              # The checkout fetched every branch (fetch-depth: 0) and holds no
+              # credentials, so ask the local copy, not the remote.
+              if g rev-parse --verify -q "refs/remotes/origin/$branch" >/dev/null; then
+                branch="${branch}-r${GITHUB_RUN_NUMBER}"
+              fi
+              g switch -q -c "$branch"
+              ;;
+            plan)
+              branch="plan/issue-${ISSUE}"
+              if g rev-parse --verify -q "refs/remotes/origin/$branch" >/dev/null; then
+                # Re-planning: build on the existing branch and replace the plan
+                # it holds, so the push is a fast-forward.
+                g switch -q -C "$branch" "refs/remotes/origin/$branch"
+                old="$(g diff --name-only --diff-filter=A "$BASE_SHA" HEAD -- docs/plans/ || true)"
+                if [[ -n "$old" ]]; then printf '%s\n' "$old" | while IFS= read -r f; do g rm -q -- "$f"; done; fi
+              else
+                g switch -q -c "$branch"
+              fi
+              ;;
+            feedback)
+              branch="$HEAD_REF"
+              ;;
+          esac
+
+          # Never write through a symlinked directory in the checkout.
+          root="$(pwd -P)"
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            dir="$(dirname -- "$f")"
+            mkdir -p -- "$dir"
+            real="$(cd -- "$dir" && pwd -P)"
+            case "$real/" in "$root"/*) ;; *) echo "::error::refusing to write outside the checkout: $f"; exit 1 ;; esac
+            rm -f -- "$f"
+            cp -- "$WORK/staging/$f" "$f"
+          done < "$WORK/out/changed.txt"
+          # One index update each, not one per file: a snapshot may change thousands.
+          [[ -s "$WORK/out/changed.txt" ]] && g --literal-pathspecs add -f --pathspec-from-file="$WORK/out/changed.txt"
+          [[ -s "$WORK/out/deleted.txt" ]] && g --literal-pathspecs rm -q --ignore-unmatch --pathspec-from-file="$WORK/out/deleted.txt"
+
+          case "$MODE" in
+            implement) msg="Agent changes for #${ISSUE} (${PROVIDER})" ;;
+            plan)      msg="Implementation plan for #${ISSUE} (${PROVIDER})" ;;
+            feedback)  msg="Address review feedback on #${PR_NUMBER} (${PROVIDER})" ;;
+          esac
+          g commit -q --no-verify -m "$msg"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # The token goes to this one command as an HTTP header and is never
+      # written to disk. A plain push, never forced: a branch that moved during
+      # the run rejects it, and that is reported rather than overwritten.
+      - name: Push
+        id: push
+        if: steps.commit.outcome == 'success'
+        working-directory: repo
+        env:
+          TOKEN: ${{ secrets.publish_token || github.token }}
+          BRANCH: ${{ steps.commit.outputs.branch }}
+        run: |
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          if git -c core.hooksPath=/dev/null -c "http.https://github.com/.extraheader=$auth" \
+               push origin "HEAD:refs/heads/$BRANCH" 2> "$WORK/push.err"; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          else
+            cat "$WORK/push.err"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            # Only a rejection because the branch moved is reported as "moved".
+            if grep -qE 'non-fast-forward|fetch first|\[rejected\]' "$WORK/push.err"; then
+              echo "moved=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Read the agent's report
+        id: report
+        if: always() && inputs.agent_result == 'success'
+        run: |
+          python3 -I - "$WORK/in" "$WORK/out" <<'PY'
+          import os, re, sys, json
+          src, out = sys.argv[1:3]
+
+          def read(name, limit=60000):
+              try:
+                  with open(os.path.join(src, name), encoding="utf-8", errors="replace") as fh:
+                      return fh.read(limit)
+              except OSError:
+                  return ""
+
+          msg = read("final-message.md")
+          # Untrusted text: no closing keywords, no mentions, no way out of the fence.
+          msg = re.sub(r"(?i)\b(close[sd]?|fix(e[sd])?|resolve[sd]?)(\s*:?\s+)(#|[\w.-]+/[\w.-]+#)(\d+)", r"\1\3\4 \5", msg)
+          msg = msg.replace("@", "@​").replace("~~~", "~​~~")
+          with open(os.path.join(out, "message.md"), "w") as fh:
+              fh.write(msg.strip())
+
+          metrics = {}
+          try:
+              raw = json.loads(read("metrics.json") or "{}")
+              for k, v in raw.items():
+                  if re.fullmatch(r"[a-z_]{1,32}", str(k)) and isinstance(v, (int, float)) and not isinstance(v, bool):
+                      metrics[k] = v
+          except Exception:
+              pass
+          with open(os.path.join(out, "metrics.json"), "w") as fh:
+              json.dump(metrics, fh)
+          PY
+
+      # ── Open the PR, and report ──────────────────────────────────────────────
+      - name: Open the pull request
+        id: pr
+        if: steps.push.outputs.pushed == 'true' && inputs.mode == 'implement'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BRANCH: ${{ steps.commit.outputs.branch }}
+        with:
+          github-token: ${{ secrets.publish_token || github.token }}
+          script: |
+            const fs = require('fs');
+            const W = process.env.WORK;
+            const { owner, repo } = context.repo;
+            const n = Number(process.env.ISSUE);
+            const list = f => fs.readFileSync(`${W}/out/${f}.txt`, 'utf8').split('\n').filter(Boolean);
+            const message = fs.readFileSync(`${W}/out/message.md`, 'utf8');
+            // File names come from the agent: no mentions, no closing keywords.
+            const code = f => '`' + f.replace(/@/g, '@\u200b').replace(/#/g, '#\u200b') + '`';
+            const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: n });
+            const name = { 'openai-codex': 'OpenAI Codex', gemini: 'Gemini' }[process.env.PROVIDER] || process.env.PROVIDER;
+            const complexity = (issue.labels.map(l => l.name).find(l => l.startsWith('vip-complexity:')) || 'vip-complexity:unset').split(':')[1];
+
+            const body = [
+              '## 🤖 Agent-Generated PR',
+              '',
+              `Closes #${n}`,
+              '',
+              `**Agent Used:** ${name}`,
+              `**Complexity:** ${complexity}`,
+              '',
+              '---',
+              '',
+              '### Changes',
+              '',
+              ...list('changed').map(f => `- ${code(f)}`),
+              ...list('deleted').map(f => `- ${code(f)} (deleted)`),
+              '',
+              '### The agent\'s notes',
+              '',
+              'Written by the agent. Nothing in it was verified by this workflow.',
+              '',
+              '~~~text',
+              message || '(no final message)',
+              '~~~',
+            ];
+            const flagged = list('flagged');
+            if (flagged.length) body.push('', '### ⚠️ Changes to agent or tool configuration', '',
+              'These files steer agents or developer tools. Review them before anything else:', '',
+              ...flagged.map(f => `- ${code(f)}`));
+            const refused = list('refused');
+            if (refused.length) body.push('', '### Not included', '',
+              'The agent changed these, and they were left out: an agent may not edit workflows, agent settings, CODEOWNERS or secrets files.', '',
+              ...refused.map(f => `- ${code(f)}`));
+
+            try {
+              const { data: pr } = await github.rest.pulls.create({
+                owner, repo, head: process.env.BRANCH, base: context.payload.repository.default_branch,
+                title: issue.title, body: body.join('\n'),
+              });
+              await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: ['vip-agent-generated'] }).catch(() => {});
+              core.setOutput('url', pr.html_url);
+              core.setOutput('number', String(pr.number));
+            } catch (err) {
+              const notPermitted = /not permitted to create or approve pull requests/i.test(err.message);
+              core.setOutput('error', notPermitted ? 'not-permitted' : 'other');
+              core.setFailed(`Could not open the pull request: ${err.message}`);
+            }
+
+      - name: Report
+        if: always() && inputs.agent_result == 'success'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          VERDICT: ${{ steps.validate.outputs.verdict }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          MOVED: ${{ steps.push.outputs.moved }}
+          COMMITTED: ${{ steps.commit.outcome }}
+          CUSTOM_TOKEN: ${{ secrets.publish_token != '' }}
+          BRANCH: ${{ steps.commit.outputs.branch }}
+          SHA: ${{ steps.commit.outputs.sha }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          PR_ERROR: ${{ steps.pr.outputs.error }}
+          DUPE: ${{ steps.dupe.outputs.exists }}
+        with:
+          script: |
+            const fs = require('fs');
+            const W = process.env.WORK;
+            const { owner, repo } = context.repo;
+            const mode = process.env.MODE;
+            const target = Number(mode === 'feedback' ? process.env.PR_NUMBER : process.env.ISSUE);
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const read = f => { try { return fs.readFileSync(`${W}/out/${f}`, 'utf8'); } catch { return ''; } };
+            const list = f => read(`${f}.txt`).split('\n').filter(Boolean);
+            const verdict = process.env.VERDICT;
+            const name = { 'openai-codex': 'Codex', gemini: 'Gemini' }[process.env.PROVIDER] || process.env.PROVIDER;
+
+            // The same metrics line for every provider. A number the provider
+            // does not report says so, rather than reading $0 or "unknown".
+            let metrics = {};
+            try { metrics = JSON.parse(read('metrics.json') || '{}'); } catch {}
+            const show = (k, label, fmt = v => String(v)) =>
+              `${label}: **${k in metrics ? fmt(metrics[k]) : `not reported by ${name}`}**`;
+            const metricLine = [
+              show('turns', 'Turns'),
+              show('cost_usd', 'Cost', v => `$${v.toFixed(2)}`),
+              show('tokens', 'Tokens'),
+              show('tool_failures', 'Refused or failed tool calls'),
+            ].join(' · ');
+
+            // File names come from the agent: no mentions, no closing keywords.
+            const code = f => '`' + f.replace(/@/g, '@\u200b').replace(/#/g, '#\u200b') + '`';
+            const message = read('message.md');
+            const notes = message ? ['', 'The agent\'s notes (written by the agent, not verified):', '', '~~~text', message, '~~~'] : [];
+            const refused = list('refused'), flagged = list('flagged');
+            const extra = [];
+            if (refused.length) extra.push('', mode === 'plan'
+              ? 'Left out — a planning run publishes only `docs/plans/`, and an agent may not change workflows, agent settings, CODEOWNERS or secrets files:'
+              : 'Left out — an agent may not change workflows, agent settings, CODEOWNERS or secrets files:', ...refused.map(f => `- ${code(f)}`));
+            if (flagged.length) extra.push('', 'Flagged for review — they steer agents or tools:', ...flagged.map(f => `- ${code(f)}`));
+
+            const upsert = async (marker, lines) => {
+              const body = [marker, ...lines].join('\n');
+              const { data: existing } = await github.rest.issues.listComments({ owner, repo, issue_number: target, per_page: 100 });
+              const mine = existing.find(c => c.body && c.body.includes(marker));
+              if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+              else await github.rest.issues.createComment({ owner, repo, issue_number: target, body });
+            };
+            const REPORT = '<!-- agentic-workflow:run-report -->';
+            const what = { implement: 'pull request', plan: 'plan', feedback: 'commit' }[mode];
+
+            if (process.env.DUPE === 'true') return;
+            if (!verdict) {
+              await upsert(REPORT, [
+                '### Publishing failed',
+                '',
+                `The agent finished, but its snapshot could not be checked. Nothing was published. See the [run log](${runUrl}).`,
+              ]);
+              core.setFailed('The snapshot could not be validated.');
+              return;
+            }
+            if (verdict === 'reject') {
+              await upsert(REPORT, [
+                '### The agent\'s changes were not published',
+                '',
+                `The snapshot was rejected: ${read('reason')}.`,
+                '',
+                'Nothing from this run reached the repository. This is a safety check, not a',
+                'judgement on the code: it refuses links, nested git data, oversized files and',
+                `anything containing the provider's key. Detail: [run log](${runUrl}).`,
+              ]);
+              core.setFailed(`Snapshot rejected: ${read('reason')}`);
+              return;
+            }
+            if (verdict === 'nothing') {
+              await upsert(REPORT, [
+                `### The agent ran, but produced no ${what}`,
+                '',
+                metricLine,
+                '',
+                `Reason: ${read('reason')}. Full detail: [job summary and log](${runUrl}).`,
+                ...extra,
+                '',
+                'A run that changes nothing and reports success is the failure this template',
+                'exists to prevent, so it is reported here rather than left silent.',
+              ]);
+              return;
+            }
+            if (process.env.PUSHED !== 'true') {
+              let lines;
+              if (process.env.COMMITTED !== 'success') {
+                lines = [
+                  '### The agent\'s changes could not be committed',
+                  '',
+                  `Nothing was published. See the [run log](${runUrl}).`,
+                ];
+              } else if (process.env.MOVED === 'true' && mode === 'feedback') {
+                lines = [
+                  '### The fix was not pushed: the branch moved',
+                  '',
+                  `\`${process.env.BRANCH}\` gained commits while the agent was working, and this`,
+                  'workflow never force-pushes. Comment `@vip-agent` again to run on the new head.',
+                ];
+              } else {
+                lines = [
+                  '### The agent\'s changes could not be pushed',
+                  '',
+                  `See the [run log](${runUrl}). If a ruleset requires signed commits, agent`,
+                  'commits from this workflow are rejected: that is a known limitation.',
+                ];
+              }
+              await upsert(REPORT, lines);
+              core.setFailed('Publishing failed.');
+              return;
+            }
+            if (mode === 'implement' && !process.env.PR_URL) {
+              const lines = process.env.PR_ERROR === 'not-permitted' ? [
+                '### The branch was pushed, but the pull request could not be opened',
+                '',
+                `\`${process.env.BRANCH}\` holds the agent's changes. GitHub refused to let this`,
+                'workflow open a pull request because a repository setting is off:',
+                '',
+                '**Settings → Actions → General → Workflow permissions → "Allow GitHub Actions to create and approve pull requests"**',
+                '',
+                'Turn it on, then open the PR from the branch by hand or re-run the agent. That',
+                'setting also lets workflows approve pull requests; require code-owner or team',
+                'review in a ruleset if that matters here.',
+              ] : [
+                '### The branch was pushed, but the pull request could not be opened',
+                '',
+                `\`${process.env.BRANCH}\` holds the agent's changes. See the [run log](${runUrl}).`,
+              ];
+              await upsert(REPORT, lines);
+              return;
+            }
+
+            // Success. Overwrite a stale "produced nothing" from an earlier run.
+            const { data: existing } = await github.rest.issues.listComments({ owner, repo, issue_number: target, per_page: 100 });
+            const stale = existing.find(c => c.body && c.body.includes(REPORT));
+            if (mode === 'plan') {
+              const plan = list('changed').find(f => f.endsWith('.md'));
+              const url = `${context.serverUrl}/${owner}/${repo}/blob/${process.env.BRANCH}/${plan}`;
+              await github.rest.issues.createComment({ owner, repo, issue_number: target, body: [
+                `Implementation plan: ${url}`,
+                '',
+                'Implementation plan is ready for review. Reply /approve-plan to begin',
+                'implementation.',
+                '',
+                'To change the plan first: edit the file on the plan branch, or add your feedback',
+                'to this issue and re-apply the vip-agent-ready label to replan. Commenting alone',
+                'does not trigger anything — only /approve-plan is listened for.',
+                '',
+                metricLine,
+                ...notes,
+                ...extra,
+              ].join('\n') });
+            } else if (mode === 'feedback') {
+              await github.rest.issues.createComment({ owner, repo, issue_number: target, body: [
+                `Pushed ${process.env.SHA} to \`${process.env.BRANCH}\`.`,
+                '',
+                metricLine,
+                ...notes,
+                ...extra,
+              ].join('\n') });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: target, body: [
+                `Opened ${process.env.PR_URL}.`,
+                '',
+                metricLine,
+                '',
+                ...(process.env.CUSTOM_TOKEN === 'true' ? [
+                  'CI has already started on it with this repository\'s secrets, because it was opened',
+                  'with VIP_AGENT_PUBLISH_TOKEN. Read the diff before merging — especially dependency',
+                  'manifests and CI scripts.',
+                ] : [
+                  'Its CI waits for a maintainer to approve the run. Read the diff first — especially',
+                  'dependency manifests and CI scripts — because approving runs agent-written code',
+                  'with this repository\'s secrets.',
+                ]),
+                ...extra,
+              ].join('\n') });
+            }
+            if (stale) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: stale.id,
+                body: `${REPORT}\nA later [run](${runUrl}) produced a ${what}. The earlier report no longer applies.` });
+            }
