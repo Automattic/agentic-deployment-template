@@ -18,8 +18,11 @@ description: >-
 # ignored, which is worse than duplicating it. scripts/vip-validate-workflows.sh
 # checks the job-level values still agree.
 #
-# Credentials arrive as inputs because a composite action cannot read the
-# `secrets` context. Callers pass `${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}`.
+# Credentials and settings arrive as inputs because a composite action cannot
+# read the `secrets` or `vars` contexts. Callers pass
+# `${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}` and `${{ vars.AGENT_DEBUG }}`. A `vars`
+# reference here fails the whole action at load time, before Claude starts;
+# scripts/vip-validate-workflows.sh rejects one.
 
 inputs:
   oauth_token:
@@ -51,6 +54,10 @@ inputs:
     description: "Token used to post the do-nothing comment. Required with report_issue_number."
     required: false
     default: ""
+  debug:
+    description: "Set to 'true' to stream the full SDK output to the job log. Callers pass `vars.AGENT_DEBUG`."
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -89,7 +96,7 @@ runs:
         # GitHub's own debug logging does not reveal SDK output — that was
         # tested, and the re-run returned nothing. Turn it on for one run in a
         # non-sensitive repo, read the log, turn it off.
-        show_full_output: ${{ vars.AGENT_DEBUG == 'true' }}
+        show_full_output: ${{ inputs.debug == 'true' }}
 
         # ADD YOUR PROJECT'S TEST AND LINT COMMANDS TO `allow` BELOW.
         #
@@ -160,10 +167,14 @@ runs:
     # only trace was in the raw job log, where nobody looks.
     #
     # Everything needed is already in the execution log the action writes. Its
-    # final `result` record carries num_turns, total_cost_usd and
-    # permission_denials_count — the last one read 3, 9 and 10 across three real
-    # runs, and never reached a human. A denial count is not trivia: it is
-    # usually the agent being unable to run your test suite.
+    # final `result` record carries num_turns, total_cost_usd and a
+    # permission_denials array — 3, 9 and 10 entries across three real runs,
+    # and never reached a human. A denial count is not trivia: it is usually
+    # the agent being unable to run your test suite.
+    #
+    # The record in the file is the raw SDK message, which has the array, not
+    # the permission_denials_count that the action prints to the job log. Read
+    # only the count and every report says 0 denials (observed: log 9, report 0).
     #
     # The action exposes no `result` output, only a path to that log, so this
     # reads the file rather than a convenient output.
@@ -203,8 +214,8 @@ runs:
         fi
 
         turns="$(printf '%s' "$result" | jq -r '.num_turns // "?"')"
-        cost="$(printf '%s' "$result" | jq -r '.total_cost_usd // 0')"
-        denials="$(printf '%s' "$result" | jq -r '.permission_denials_count // 0')"
+        cost="$(LC_NUMERIC=C printf '%.2f' "$(printf '%s' "$result" | jq -r '.total_cost_usd // 0')")"
+        denials="$(printf '%s' "$result" | jq -r '.permission_denials_count // (.permission_denials // [] | length)')"
         errored="$(printf '%s' "$result" | jq -r '.is_error // false')"
 
         {

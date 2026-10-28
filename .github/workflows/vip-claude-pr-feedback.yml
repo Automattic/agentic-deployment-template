@@ -107,4 +107,5 @@ jobs:
         uses: ./.github/actions/vip-claude-run
         with:
           oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          debug: ${{ vars.AGENT_DEBUG }}
           trigger_phrase: "@claude"
