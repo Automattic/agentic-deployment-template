@@ -1,37 +1,38 @@
-# Reports when this copy of the template and the public copy diverge.
+# Reports when the canonical template and the copy customers receive diverge.
 #
-# This file lives on BOTH copies and runs on only one. The job is guarded on
-# the repository name, so on the public copy it is inert.
+# There are three copies of this repository:
 #
-# That is deliberate. An enterprise-only file makes the two trees permanently
-# unequal, which means every sync needs a merge commit rather than a
-# fast-forward — and a mechanism built to prevent silent drift should not make
-# staying in sync harder. Identical trees fast-forward forever.
+#   whyisjake/agentic-deployment-template on github.com
+#     Canonical. Development happens here, and setup.sh and the README point
+#     at it.
+#   Automattic/agentic-deployment-template on github.com
+#     The copy the Codebase Manager scaffolds into customer repositories. It
+#     has Actions disabled and is updated by fast-forward pushes from the
+#     canonical copy.
+#   Automattic/agentic-deployment-template on github.a8c.com
+#     A source mirror. Nothing in production reads it, and it has no runners.
 #
-# scripts/setup.sh does not install it: it watches two internal copies and
-# means nothing inside a customer's repo.
+# This check compares the first two, because a difference between them is a
+# difference between what we test and what customers get. It runs on the
+# canonical copy, the only one of the three with working runners. Both copies
+# are public on github.com, so no credentials are needed to read the other one.
 #
-# The direction is the whole point. A runner here is expected to reach
-# github.com; a public runner cannot reach this host. So this is the only side
-# from which both trees are visible, and a check on the public side could only
-# ever compare that copy against itself.
+# This file lives on all three copies and runs on only one. The job is guarded
+# on the host as well as the repository name: the Automattic name exists on
+# both hosts, so a name-only guard cannot tell them apart. An edit made to one
+# copy alone makes the trees unequal, and then every sync needs a merge commit
+# instead of a fast-forward. Keeping the file identical everywhere avoids that.
 #
-# "Expected to" is doing real work in that sentence. This job had never once
-# executed before VIPPROD-1154 -- it requested a runner label the enterprise
-# instance does not serve -- so outbound reachability from a `secex` runner to
-# github.com has never actually been observed. The fetch step below already
-# treats an unreachable public copy as a reportable outcome rather than as
-# in-sync, so a first run that cannot clone will say so plainly rather than
-# going quiet. That is the answer either way; it just has not been tested yet.
+# scripts/setup.sh does not install it. It watches the template's own copies
+# and means nothing inside a customer's repo.
 #
-# It compares CONTENT, not the presence of paths. When these copies last
-# drifted, seven files existed on both sides with different contents — every
-# one of them a workflow the customer would run. A manifest of filenames would
-# have reported everything fine.
+# It compares CONTENT, not the presence of paths. When the copies last drifted,
+# seven files existed on both sides with different contents, and every one was
+# a workflow the customer would run. A manifest of filenames would have
+# reported everything fine.
 #
-# It reports; it never pushes. Which copy is canonical is an open question
-# (VIPPROD-1048), and a mechanism that silently picked a winner would decide it
-# by accident.
+# It reports and never pushes. Updating the customer copy is a deliberate step,
+# which a maintainer approves.
 
 name: Template Drift Check
 
@@ -46,38 +47,27 @@ permissions:
 
 jobs:
   compare:
-    # Only the enterprise copy can do this. A runner there can reach github.com;
-    # a public runner cannot reach the enterprise host, so the same job there
-    # could only compare that copy against itself.
-    if: github.repository == 'Automattic/agentic-deployment-template'
-
-    # The enterprise instance serves no `ubuntu-latest`. Every run of this job
-    # since it was written queued against that label for 26-38 hours and was
-    # killed before starting -- "Requested labels: ubuntu-latest / Waiting for a
-    # runner to pick up this job... / Job is completed before starting." So the
-    # check that exists to notice drift has never once run. See VIPPROD-1154.
-    #
-    # This label is safe to carry on the public copy too, even though nothing
-    # there can serve it: the `if:` above is evaluated before a runner is
-    # allocated, so on the public copy the job is skipped and the label is never
-    # resolved. That matters because this file has to stay byte-identical on
-    # both copies -- an enterprise-only edit is exactly the drift it reports.
-    runs-on: [self-hosted, secex, gha-runner-1cpu-1gb]
+    # Only the canonical copy on github.com. The `if:` is evaluated before a
+    # runner is allocated, so on the other copies the job is skipped and its
+    # `runs-on` label is never resolved. That matters on github.a8c.com, which
+    # serves no `ubuntu-latest`.
+    if: github.server_url == 'https://github.com' && github.repository == 'whyisjake/agentic-deployment-template'
+    runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
       - name: Check out this copy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: enterprise
+          path: canonical
 
-      - name: Fetch the public copy
+      - name: Fetch the customer copy
         id: fetch
         run: |
           if ! git clone --quiet --depth 1 \
-              https://github.com/whyisjake/agentic-deployment-template.git public; then
+              https://github.com/Automattic/agentic-deployment-template.git customer; then
             echo "reachable=false" >> "$GITHUB_OUTPUT"
-            echo "Could not reach the public copy. Reporting that, rather than reporting in-sync."
+            echo "Could not reach the customer copy. Reporting that, rather than reporting in-sync."
             exit 0
           fi
           echo "reachable=true" >> "$GITHUB_OUTPUT"
@@ -95,10 +85,10 @@ jobs:
           # is reported rather than aborting the run.
           report=""
           for p in "${paths[@]}"; do
-            if [[ ! -e "enterprise/$p" && ! -e "public/$p" ]]; then continue; fi
-            if [[ ! -e "enterprise/$p" ]]; then report+="only in public: $p"$'\n'; continue; fi
-            if [[ ! -e "public/$p" ]]; then report+="only in enterprise: $p"$'\n'; continue; fi
-            if ! out="$(diff -ru "enterprise/$p" "public/$p" 2>&1)"; then
+            if [[ ! -e "canonical/$p" && ! -e "customer/$p" ]]; then continue; fi
+            if [[ ! -e "canonical/$p" ]]; then report+="only in the customer copy: $p"$'\n'; continue; fi
+            if [[ ! -e "customer/$p" ]]; then report+="only in the canonical copy: $p"$'\n'; continue; fi
+            if ! out="$(diff -ru "canonical/$p" "customer/$p" 2>&1)"; then
               report+="$out"$'\n'
             fi
           done
@@ -120,20 +110,20 @@ jobs:
           script: |
             const fs = require('fs');
             const drift = fs.readFileSync('drift.txt', 'utf8').slice(0, 55000);
-            const title = 'Template drift: the enterprise and public copies disagree';
+            const title = 'Template drift: the canonical and customer copies disagree';
 
             const { data: existing } = await github.rest.issues.listForRepo({
               owner: context.repo.owner, repo: context.repo.repo,
               state: 'open', labels: 'template-drift', per_page: 20,
             });
             const body = [
-              'The copy customers receive and the copy `setup.sh` and the README point at',
-              'have diverged.',
+              'This copy and github.com/Automattic/agentic-deployment-template, the copy',
+              'the Codebase Manager scaffolds into customer repositories, have diverged.',
               '',
-              'This matters because the enterprise copy is what gets cloned into customer',
-              'repositories, while every documented install path reads the public one. When',
-              'these last drifted, seven workflow files differed and nobody noticed for two',
-              'merged pull requests.',
+              'This matters because the customer copy is what gets installed, while tests',
+              'and every documented install path use this one. When the copies last',
+              'drifted, seven workflow files differed and nobody noticed for two merged',
+              'pull requests.',
               '',
               '<details><summary>Diff</summary>',
               '',
@@ -143,8 +133,8 @@ jobs:
               '',
               '</details>',
               '',
-              'Resolve by fast-forwarding whichever copy is behind. Which one is canonical is',
-              'still open — see VIPPROD-1048.',
+              'Resolve by fast-forwarding the customer copy from this one. If the',
+              'customer copy is ahead, find out why before overwriting anything.',
             ].join('\n');
 
             if (existing.length > 0) {
@@ -163,4 +153,4 @@ jobs:
       - name: Say what could not be checked
         if: steps.fetch.outputs.reachable == 'false'
         run: |
-          echo "::warning::Could not reach the public copy — drift was not verified this run."
+          echo "::warning::Could not reach the customer copy, so drift was not verified this run."
