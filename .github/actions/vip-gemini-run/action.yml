@@ -1,0 +1,164 @@
+# vip-template-version: 2
+name: "Prepare a Gemini run"
+description: >-
+  Writes the Gemini CLI settings, the user-tier deny policies and the prompt for
+  one run of google-github-actions/run-gemini-cli. Runs before the agent and
+  never after it: it does not invoke Gemini.
+
+# What bounds Gemini
+#
+# Gemini CLI cannot keep itself off the network on a Linux runner, and its API
+# key sits in its own environment. So it gets no tool that could reach either:
+# `tools.core` is an allowlist of file tools only — no shell, no web fetch, no
+# search. Verified on a runner with CLI 0.65.0: only those tools were offered;
+# writes to .git/, reads of /proc/self/environ (directly or through a symlink)
+# and writes outside the workspace were all refused. The deny policies below
+# repeat the rule at the policy layer, in case a later CLI version widens what
+# `tools.core` admits.
+#
+# The calling job removes the repository's own .gemini/ and .env files first:
+# workspace settings and env files would otherwise be read with the workspace
+# trusted (GEMINI_CLI_TRUST_WORKSPACE, which the action needs).
+#
+# Tool names were read from the 0.65.0 package. Re-check them when
+# gemini_cli_version changes; scripts/vip-validate-workflows.sh rejects a
+# settings block that admits a shell or web tool.
+
+inputs:
+  mode:
+    description: "implement, plan or feedback."
+    required: true
+  issue_number:
+    required: false
+    default: ""
+  issue_title:
+    required: false
+    default: ""
+  issue_body:
+    description: "Untrusted. Gemini has no shell, so the issue travels in the prompt."
+    required: false
+    default: ""
+  plan_path:
+    description: "After /approve-plan: the plan file already copied into the workspace."
+    required: false
+    default: ""
+  context:
+    description: "Feedback mode: the triggering comment and PR context, already assembled."
+    required: false
+    default: ""
+  tail:
+    description: "The shared prompt tail (VIP_PROMPT_CORE)."
+    required: true
+
+outputs:
+  settings:
+    value: ${{ steps.prepare.outputs.settings }}
+  prompt:
+    value: ${{ steps.prepare.outputs.prompt }}
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare
+      id: prepare
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        ISSUE: ${{ inputs.issue_number }}
+        TITLE: ${{ inputs.issue_title }}
+        BODY: ${{ inputs.issue_body }}
+        PLAN_PATH: ${{ inputs.plan_path }}
+        CONTEXT: ${{ inputs.context }}
+        TAIL: ${{ inputs.tail }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.gemini/policies"
+        cat > "$HOME/.gemini/policies/vip-agent-deny.toml" <<'TOML'
+        [[rule]]
+        toolName = "run_shell_command"
+        decision = "deny"
+        priority = 1000
+
+        [[rule]]
+        toolName = "web_fetch"
+        decision = "deny"
+        priority = 1000
+
+        [[rule]]
+        toolName = "google_web_search"
+        decision = "deny"
+        priority = 1000
+        TOML
+
+        settings='{"tools":{"core":["read_file","read_many_files","write_file","replace","list_directory","glob","grep_search"]},"context":{"fileName":"AGENTS.md"},"model":{"maxSessionTurns":100},"privacy":{"usageStatisticsEnabled":false}}'
+
+        fence() { printf '~~~~text\n%s\n~~~~\n' "${1//~~~~/~ ~~~}"; }
+        prompt="$({
+          case "$MODE" in
+            implement)
+              echo "You are implementing issue #${ISSUE}: $(printf '%s' "$TITLE" | tr '\n' ' ')"
+              echo
+              echo "The issue, as its author wrote it:"
+              fence "$BODY"
+              echo
+              if [[ -n "$PLAN_PATH" ]]; then
+                echo "A human approved the implementation plan at $PLAN_PATH. It is already in"
+                echo "the workspace. Read it in full and implement it, working through its"
+                echo "implementation units in order. Leave the plan file where it is."
+                echo
+              fi
+              echo "Instructions:"
+              echo "1. Read AGENTS.md, and CLAUDE.md if it exists, for project-specific guidance."
+              echo "2. Implement the change so it meets the acceptance criteria exactly."
+              echo "3. Stay within the defined scope — \"Out of scope\" is a hard boundary."
+              echo "4. Follow the patterns referenced in Technical Notes (read the files listed there)."
+              echo "5. Add or update tests. You have file tools only and cannot run them, so"
+              echo "   check your logic by reading the code carefully."
+              ;;
+            plan)
+              echo "You are planning the implementation for issue #${ISSUE}: $(printf '%s' "$TITLE" | tr '\n' ' ')"
+              echo
+              echo "The issue, as its author wrote it:"
+              fence "$BODY"
+              echo
+              echo "This is a vip-complexity:high issue. Your job is to PLAN, not implement."
+              echo
+              echo "Instructions:"
+              echo "1. Read AGENTS.md, and CLAUDE.md if it exists, for project-specific guidance."
+              echo "2. Read the key files referenced in Technical Notes to understand the codebase."
+              echo "3. Write a structured implementation plan as one markdown file saved to:"
+              echo "   docs/plans/YYYY-MM-DD-NNN-<type>-<short-title>-plan.md"
+              echo "   It should include: problem frame, requirements, scope boundaries, key"
+              echo "   technical decisions, and implementation units (each with goal, files,"
+              echo "   approach, and test scenarios)."
+              echo "4. Write nothing else. Do NOT write application code."
+              ;;
+            feedback)
+              printf '%s\n' "$CONTEXT"
+              echo
+              echo "Read AGENTS.md, and CLAUDE.md if it exists, for project-specific guidance."
+              ;;
+          esac
+          echo
+          echo "HOW YOUR WORK IS PUBLISHED:"
+          echo
+          echo "You only edit files. You cannot run commands, commit, push, or open a pull"
+          echo "request: a separate step publishes your changes when you finish."
+          echo "Changes to .github/, .claude/, CODEOWNERS, .gitattributes, .env files and"
+          echo "agent settings directories are discarded, so do not make them."
+          echo
+          echo "End with a final message for the reviewer: what you changed, which acceptance"
+          echo "criteria it meets, and anything you could not verify or had to assume. It is"
+          echo "published with your changes as written: in the pull request, or in the comment"
+          echo "that reports a plan or a fix."
+          echo
+          printf '%s\n' "$TAIL"
+        })"
+
+        delim="VIP_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+        {
+          echo "settings=$settings"
+          echo "prompt<<$delim"
+          printf '%s\n' "$prompt"
+          echo "$delim"
+        } >> "$GITHUB_OUTPUT"

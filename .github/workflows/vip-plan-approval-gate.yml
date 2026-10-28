@@ -123,6 +123,7 @@ jobs:
         uses: ./.github/actions/vip-claude-run
         with:
           oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          debug: ${{ vars.AGENT_DEBUG }}
           report_issue_number: ${{ github.event.issue.number }}
           github_token: ${{ github.token }}
           prompt: |

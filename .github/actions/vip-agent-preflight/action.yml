@@ -1,0 +1,178 @@
+# vip-template-version: 2
+name: "Agent preflight"
+description: >-
+  Decides whether a vip-agent-ready label event may start an agent, for every
+  provider. Checks who applied the label, reads the issue's labels, screens the
+  issue's structure and looks for an agent PR that is already open. Comments on
+  the issue when it refuses for a reason the issue's author can fix.
+
+# Why this is its own job
+#
+# Every provider needs the same four checks, and they need `issues: write` to
+# explain a refusal. The agent jobs that follow must not hold that scope for
+# longer than they need it, and no local action may run after an agent step —
+# an agent can rewrite `.github/actions/*` and a later step would run the
+# rewritten file (verified: GitHub reads a local action from disk when the step
+# starts, not when the job does). Running the checks in a separate job before
+# any agent keeps both rules without duplicating them per provider.
+#
+# The caller must check out the repository first, with persist-credentials:
+# false. `base_sha` is the commit that checkout produced: the trusted publish
+# job applies a non-Claude agent's snapshot to exactly that commit.
+
+outputs:
+  proceed:
+    description: "'true' when an agent may run."
+    value: ${{ steps.verdict.outputs.proceed }}
+  is_high:
+    description: "'true' when the issue is labelled vip-complexity:high (plan first)."
+    value: ${{ steps.labels.outputs.is_high }}
+  base_sha:
+    description: "The commit the agent starts from."
+    value: ${{ steps.verdict.outputs.base_sha }}
+
+runs:
+  using: composite
+  steps:
+    # The real trust boundary is here, not in any allow list. An agent run takes
+    # the issue body as instructions, so what bounds it is who can cause one to
+    # start.
+    - name: Require the labelling actor to have write access
+      id: actor
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      with:
+        script: |
+          const actor = context.payload.sender?.login;
+          if (!actor) {
+            core.setOutput('allowed', 'false');
+            console.log('No sender on the event — refusing.');
+            return;
+          }
+          let level = 'none';
+          try {
+            const r = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: actor,
+            });
+            level = r.data.permission;
+          } catch (err) {
+            level = 'none';
+          }
+          const allowed = ['write', 'admin'].includes(level);
+          console.log(`Label applied by ${actor} (permission: ${level}) — allowed: ${allowed}`);
+          if (!allowed) {
+            console.log('The vip-agent-ready label was not applied by someone with write access.');
+            console.log('Nothing will run. A maintainer can apply the label to start the agent.');
+          }
+          core.setOutput('allowed', allowed ? 'true' : 'false');
+
+    # Labels come from the API, not from github.event: a `labeled` event carries
+    # one label, so an issue that gains vip-agent-ready and vip-complexity:high
+    # close together could otherwise route on whichever arrived first and skip
+    # the planning phase.
+    - name: Read the issue's labels
+      if: steps.actor.outputs.allowed == 'true'
+      id: labels
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      with:
+        script: |
+          const { data: issue } = await github.rest.issues.get({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.payload.issue.number,
+          });
+          const labels = issue.labels.map(l => (typeof l === 'string' ? l : l.name));
+          const ready = labels.includes('vip-agent-ready');
+          const isHigh = labels.includes('vip-complexity:high');
+          console.log('Issue labels:', labels.join(', ') || '(none)');
+          console.log('vip-agent-ready:', ready, '| vip-complexity:high:', isHigh);
+          if (!ready) console.log('Not labelled vip-agent-ready — nothing to do.');
+          core.setOutput('ready', ready ? 'true' : 'false');
+          core.setOutput('is_high', isHigh ? 'true' : 'false');
+
+    # Applying vip-agent-ready to a half-written issue used to run the agent
+    # anyway. It would spend turns and money on a brief with no acceptance
+    # criteria, then produce something nobody asked for. Refusing costs seconds
+    # and says what is missing.
+    - name: Screen the issue before spending anything
+      id: screen
+      if: steps.actor.outputs.allowed == 'true' && steps.labels.outputs.ready == 'true'
+      uses: ./.github/actions/vip-screen-issue
+      with:
+        issue_body: ${{ github.event.issue.body }}
+
+    - name: Refuse a malformed issue
+      if: steps.screen.outputs.ready == 'false'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        MISSING: ${{ steps.screen.outputs.missing }}
+      with:
+        script: |
+          const missing = (process.env.MISSING || '').split('\n').filter(Boolean);
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.payload.issue.number,
+            body: [
+              '### Not started — this issue is missing some structure',
+              '',
+              'The agent was not run. These are missing:',
+              '',
+              ...missing.map(m => `- ${m}`),
+              '',
+              'Add them and re-apply `vip-agent-ready` to start. Removing and re-adding the',
+              'label is what fires the trigger — re-applying a label that is already there',
+              'emits no event.',
+              '',
+              'This check is structural: it confirms the sections exist, not that they say',
+              'anything useful. It is here so the agent does not spend turns on a brief',
+              'that cannot be executed.'
+            ].join('\n')
+          });
+
+    # Without this, removing and re-applying the label starts a second full run
+    # and opens a second pull request against the same issue.
+    - name: Check for an existing agent PR
+      id: pr-check
+      if: steps.actor.outputs.allowed == 'true' && steps.labels.outputs.ready == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      with:
+        script: |
+          const n = context.payload.issue.number;
+          const { data: prs } = await github.rest.pulls.list({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            state: 'open',
+            per_page: 100,
+          });
+          const existing = prs.find(pr =>
+            pr.body && new RegExp(`(closes|fixes|resolves)\\s+#${n}\\b`, 'i').test(pr.body)
+          );
+          if (existing) {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: n,
+              body: `An agent pull request for this issue is already open: ${existing.html_url}\n\nNo second run was started. Close that pull request first if you want the agent to start over.`,
+            });
+            console.log(`Existing PR found: ${existing.html_url} — skipping.`);
+          }
+          core.setOutput('already_running', existing ? 'true' : 'false');
+
+    - name: Decide
+      id: verdict
+      shell: bash
+      env:
+        ALLOWED: ${{ steps.actor.outputs.allowed }}
+        READY: ${{ steps.labels.outputs.ready }}
+        SCREENED: ${{ steps.screen.outputs.ready }}
+        ALREADY: ${{ steps.pr-check.outputs.already_running }}
+      run: |
+        proceed=false
+        if [[ "$ALLOWED" == "true" && "$READY" == "true" && "$SCREENED" == "true" && "$ALREADY" == "false" ]]; then
+          proceed=true
+        fi
+        echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
+        echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        echo "Preflight: proceed=$proceed"
