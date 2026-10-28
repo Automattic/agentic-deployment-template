@@ -39,6 +39,7 @@
 #
 # AGENT PROVIDER:
 #   AGENT_PROVIDER=claude  — choose the provider without being prompted
+#                            (claude, openai-codex, gemini, copilot, custom)
 #   SKIP_AGENT_SETUP=1     — skip the provider section entirely
 #
 #   The provider's credential is never set here. Secrets are write-only and it
@@ -181,6 +182,7 @@ WORKFLOW_FILES=(
   ".github/workflows/vip-validate-workflows.yml"
   ".github/workflows/vip-claude-pr-feedback.yml"
   ".github/workflows/vip-agent-publish.yml"
+  ".github/workflows/vip-agent-pr-feedback.yml"
 )
 
 for file in "${WORKFLOW_FILES[@]}"; do
@@ -269,6 +271,7 @@ secret_for_provider() {
   case "$1" in
     claude)       printf '%s' "CLAUDE_CODE_OAUTH_TOKEN" ;;
     openai-codex) printf '%s' "OPENAI_API_KEY" ;;
+    gemini)       printf '%s' "GEMINI_API_KEY" ;;
     *)            printf '%s' "" ;;
   esac
 }
@@ -286,18 +289,20 @@ else
   if [[ -z "$provider" ]]; then
     if [[ -t 0 ]]; then
       echo "  Which agent should run agent-ready issues?"
-      echo "    1) claude        — the only provider implemented"
-      echo "    2) openai-codex  — NOT IMPLEMENTED: a stub you must write yourself"
-      echo "    3) copilot       — NOT IMPLEMENTED: a stub you must write yourself"
-      echo "    4) custom        — repository_dispatch only; you write the listener"
+      echo "    1) claude        — Claude Code (default)"
+      echo "    2) openai-codex  — OpenAI Codex, edits files; a trusted job opens the PR"
+      echo "    3) gemini        — Gemini CLI, file tools only; a trusted job opens the PR"
+      echo "    4) copilot       — NOT IMPLEMENTED: a stub you must write yourself"
+      echo "    5) custom        — repository_dispatch only; you write the listener"
       choice=""
       read -r -p "  Choice [1]: " choice || true
       case "${choice:-1}" in
         1|""|claude)      provider="claude" ;;
         2|openai-codex)   provider="openai-codex" ;;
-        3|copilot)        provider="copilot" ;;
-        4|custom)         provider="custom" ;;
-        *) red "  Not one of the four choices: $choice"; exit 1 ;;
+        3|gemini)         provider="gemini" ;;
+        4|copilot)        provider="copilot" ;;
+        5|custom)         provider="custom" ;;
+        *) red "  Not one of the five choices: $choice"; exit 1 ;;
       esac
     else
       provider="claude"
@@ -306,9 +311,21 @@ else
   fi
 
   case "$provider" in
-    claude|openai-codex|copilot|custom) ;;
-    *) red "  AGENT_PROVIDER must be one of: claude, openai-codex, copilot, custom (got: $provider)"; exit 1 ;;
+    claude|openai-codex|gemini|copilot|custom) ;;
+    *) red "  AGENT_PROVIDER must be one of: claude, openai-codex, gemini, copilot, custom (got: $provider)"; exit 1 ;;
   esac
+
+  # Codex and Gemini need the workflows this version installs. This script never
+  # overwrites a file that exists, so an older install keeps its older trigger —
+  # which has no Gemini job and a Codex stub. Switching the variable on such a
+  # repo makes labelling an issue do nothing at all. Every shipped workflow now
+  # carries a version header; a trigger without one predates these providers.
+  refuse_provider="no"
+  if [[ "$provider" == "openai-codex" || "$provider" == "gemini" ]] \
+     && [[ -f .github/workflows/vip-agent-ready-trigger.yml ]] \
+     && ! grep -q '^# vip-template-version:' .github/workflows/vip-agent-ready-trigger.yml; then
+    refuse_provider="yes"
+  fi
 
   # Set the repository variable. Needs gh, and a repo that exists on the remote —
   # a fresh local repo that has never been pushed has nothing to set it on.
@@ -319,7 +336,16 @@ else
   # makes it report "not logged in" for a repo whose own host is fine. Asking
   # about this repo answers the question that actually matters.
   variable_set="no"
-  if ! command -v gh >/dev/null 2>&1; then
+  if [[ "$refuse_provider" == "yes" ]]; then
+    echo ""
+    red   "  Not switching to '$provider': this repository's workflows predate it."
+    echo  "  .github/workflows/vip-agent-ready-trigger.yml has no vip-template-version header,"
+    echo  "  so it cannot run $provider, and this script does not overwrite existing files."
+    echo  "  To upgrade: delete the vip-* workflows and .github/actions/vip-* (keep any allow-list"
+    echo  "  edits you made in vip-claude-run), re-run this script, and review the diff."
+    echo  "  AGENT_PROVIDER was left as it is."
+    PROVIDER_NEXT_STEP="Reinstall the workflows before switching to $provider — see above."
+  elif ! command -v gh >/dev/null 2>&1; then
     yellow "  gh CLI not found — AGENT_PROVIDER not set"
   elif ! gh repo view >/dev/null 2>&1; then
     yellow "  gh cannot see a GitHub repo here — AGENT_PROVIDER not set"
@@ -331,24 +357,23 @@ else
     yellow "  could not set AGENT_PROVIDER — your gh token may lack permission on this repo"
   fi
 
-  if [[ "$variable_set" == "no" ]]; then
+  if [[ "$variable_set" == "no" && "$refuse_provider" == "no" ]]; then
     echo "  → Set it by hand: Settings → Secrets and variables → Actions → Variables → New"
     echo "    AGENT_PROVIDER = $provider"
   fi
 
   # Say plainly when the chosen provider does not do anything yet.
   #
-  # Only the claude path is implemented. openai-codex and copilot are stub jobs
-  # that echo and exit; custom dispatches a repository_dispatch event and needs a
-  # listener that does not exist yet. Either way the repo installs cleanly, syncs
-  # its labels, goes green, and then produces nothing the first time someone
-  # labels an issue.
+  # copilot is a stub job that echoes and exits; custom dispatches a
+  # repository_dispatch event and needs a listener that does not exist yet.
+  # Either way the repo installs cleanly, syncs its labels, goes green, and then
+  # produces nothing the first time someone labels an issue.
   #
   # This is one of two places that says so — the stub jobs themselves now comment
   # on the issue and fail, which is the signal that reaches someone who never ran
   # this script.
   case "$provider" in
-    openai-codex|copilot)
+    copilot)
       echo ""
       red   "  '$provider' is not implemented — its job is a stub."
       echo  "  trigger-$provider in .github/workflows/vip-agent-ready-trigger.yml echoes a"
@@ -357,7 +382,7 @@ else
       echo  "  until you write that job yourself."
       echo  "  For a working agent, re-run with: AGENT_PROVIDER=claude bash scripts/setup.sh"
       echo ""
-      PROVIDER_NEXT_STEP="Provider is $provider, which is a stub — implement trigger-$provider, or switch to claude."
+      PROVIDER_NEXT_STEP="Provider is $provider, which is a stub — implement trigger-$provider, or switch to another provider."
       ;;
     custom)
       echo ""
@@ -373,13 +398,8 @@ else
 
   # Report on the secret. Never set it.
   secret="$(secret_for_provider "$provider")"
-  if [[ "$provider" != "claude" && -n "$secret" ]]; then
-    # Name it without failing on it. trigger-openai-codex really does read
-    # secrets.OPENAI_API_KEY, so staying silent here would trade one silent gap
-    # for another — but the job is a stub, so a missing secret is not yet what
-    # stops it working.
-    dim "  Not checking for $secret — the stub never gets far enough to read it."
-    dim "  You will need it once you write the job."
+  if [[ "$refuse_provider" == "yes" ]]; then
+    dim "  Not checking secrets until the workflows are reinstalled."
   elif [[ -z "$secret" ]]; then
     dim "  Provider '$provider' has no single required secret — its credentials are yours to wire up."
   else
@@ -416,13 +436,28 @@ echo ""
 echo "  4. Agent provider:"
 echo "     $PROVIDER_NEXT_STEP"
 echo ""
-echo "  5. Install the Claude GitHub App (needed as these workflows are written):"
-echo "     Easiest: run /install-github-app from Claude Code — it does the app"
-echo "     and the secret together, and you may have done it already."
-echo "     Otherwise: https://github.com/apps/claude -> Configure -> this repo"
-echo ""
-echo "     Without it, runs fail in ~29 seconds on a 401 at the app token"
-echo "     exchange, even though labels sync and the workflow fires."
-echo ""
+case "${provider:-claude}" in
+  openai-codex|gemini)
+    echo "  5. Let workflows open pull requests:"
+    echo "     Settings → Actions → General → Workflow permissions →"
+    echo "     \"Allow GitHub Actions to create and approve pull requests\""
+    echo ""
+    echo "     The agent's PR is opened by this repository's GITHUB_TOKEN, and its CI"
+    echo "     then waits for a maintainer to approve each run. Read the diff before"
+    echo "     approving: that run executes agent-written code with your secrets. The"
+    echo "     setting also lets workflows approve PRs; require code-owner or team"
+    echo "     review in a ruleset if that matters to you."
+    echo ""
+    ;;
+  *)
+    echo "  5. Install the Claude GitHub App (recommended):"
+    echo "     Easiest: run /install-github-app from Claude Code — it does the app"
+    echo "     and the secret together, and you may have done it already."
+    echo "     Otherwise: https://github.com/apps/claude -> Configure -> this repo"
+    echo ""
+    echo "     Without it the agent still runs, but its pull requests get no CI runs."
+    echo ""
+    ;;
+esac
 echo "  Full docs: $DOCS_URL"
 echo ""

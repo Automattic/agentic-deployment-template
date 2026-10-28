@@ -1,3 +1,4 @@
+# vip-template-version: 2
 name: "Run Claude Code"
 description: >-
   Invokes anthropics/claude-code-action with this repository's agreed permission
@@ -43,6 +44,13 @@ inputs:
     required: false
     default: |
       actions: read
+  mode:
+    description: >-
+      What the run is for, which decides what counts as success: `implement` (an
+      open PR closes the issue), `plan` (plan/issue-N gained a plan file) or
+      `feedback` (no issue report).
+    required: false
+    default: implement
   report_issue_number:
     description: >-
       Issue to report a do-nothing run on. Leave empty to write the job summary
@@ -62,6 +70,20 @@ inputs:
 runs:
   using: composite
   steps:
+    # A plan run succeeds when plan/issue-N moves. Record where it was first, so
+    # a branch left over from an earlier run does not count as this run's work.
+    - name: Record the plan branch before the run
+      id: plan-before
+      if: inputs.mode == 'plan' && inputs.report_issue_number != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        BRANCH: plan/issue-${{ inputs.report_issue_number }}
+      run: |
+        sha="$(git ls-remote origin "refs/heads/$BRANCH" 2>/dev/null | cut -f1)"
+        echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+        echo "plan branch before the run: ${sha:-absent}"
+
     - name: Claude Code
       id: claude
       uses: anthropics/claude-code-action@239e3a730883eeb5c53db12b0fc9573b3024b126 # v1.0.191
@@ -251,34 +273,76 @@ runs:
     # most confidence, because nothing anywhere says so. The job is green, the
     # issue is silent, and the customer is waiting for a PR that is not coming.
     - name: Say so when the run produced nothing
-      if: always() && inputs.report_issue_number != '' && inputs.github_token != ''
+      if: always() && inputs.mode != 'feedback' && inputs.report_issue_number != '' && inputs.github_token != ''
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        MODE: ${{ inputs.mode }}
+        ISSUE: ${{ inputs.report_issue_number }}
+        PLAN_BEFORE: ${{ steps.plan-before.outputs.sha }}
+        TURNS: ${{ steps.summary.outputs.turns }}
+        COST: ${{ steps.summary.outputs.cost }}
+        DENIALS: ${{ steps.summary.outputs.denials }}
       with:
         github-token: ${{ inputs.github_token }}
         script: |
-          const n = Number('${{ inputs.report_issue_number }}');
-          const { data: prs } = await github.rest.pulls.list({
-            owner: context.repo.owner, repo: context.repo.repo,
-            state: 'open', per_page: 100,
-          });
-          const opened = prs.some(pr =>
-            pr.body && new RegExp(`(closes|fixes|resolves)\\s+#${n}\\b`, 'i').test(pr.body));
-          if (opened) return;
+          const n = Number(process.env.ISSUE);
+          const mode = process.env.MODE;
+          const { owner, repo } = context.repo;
 
-          const turns   = '${{ steps.summary.outputs.turns }}'   || 'unknown';
-          const cost    = '${{ steps.summary.outputs.cost }}'    || 'unknown';
-          const denials = '${{ steps.summary.outputs.denials }}' || 'unknown';
-          const runUrl  = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+          // What counts as success depends on what the run was for. A planning
+          // run never opens a pull request, so testing it for one reported every
+          // successful plan as "produced no pull request".
+          let produced = false;
+          if (mode === 'plan') {
+            const branch = `plan/issue-${n}`;
+            try {
+              const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+              const moved = ref.object.sha !== (process.env.PLAN_BEFORE || '');
+              const { data: dir } = await github.rest.repos.getContent({ owner, repo, path: 'docs/plans', ref: branch });
+              const hasPlan = Array.isArray(dir) && dir.some(f => f.type === 'file' && f.name.endsWith('.md'));
+              produced = moved && hasPlan;
+            } catch (err) {
+              produced = false;
+            }
+          } else {
+            const { data: prs } = await github.rest.pulls.list({ owner, repo, state: 'open', per_page: 100 });
+            produced = prs.some(pr =>
+              pr.body && new RegExp(`(closes|fixes|resolves)\\s+#${n}\\b`, 'i').test(pr.body));
+          }
+          const MARKER = '<!-- agentic-workflow:run-report -->';
+          const what = mode === 'plan' ? 'plan' : 'pull request';
+          const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+          const { data: existing } = await github.rest.issues.listComments({
+            owner, repo, issue_number: n, per_page: 100,
+          });
+          const mine = existing.find(c => c.body && c.body.includes(MARKER));
+
+          // A stale "produced nothing" left under a run that later succeeded is
+          // the confusion this comment exists to avoid, so overwrite it.
+          if (produced) {
+            if (mine) {
+              const body = [MARKER, `A later [run](${runUrl}) produced a ${what}. The earlier report no longer applies.`].join('\n');
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            }
+            return;
+          }
+
+          // A metric the run never reported is said to be unreported, not
+          // guessed as $0 or "unknown".
+          const missing = 'not reported by Claude';
+          const turns   = process.env.TURNS   || missing;
+          const cost    = process.env.COST ? `$${process.env.COST}` : missing;
+          const denials = process.env.DENIALS || missing;
 
           const lines = [
-            '### The agent ran, but produced no pull request',
+            `### The agent ran, but produced no ${what}`,
             '',
-            `It spent **${turns} turn(s)** and **$${cost}**, and hit **${denials} permission denial(s)**.`,
+            `Turns: **${turns}** · Cost: **${cost}** · Permission denials: **${denials}**`,
             '',
             `Full detail: [job summary and log](${runUrl}).`,
             '',
           ];
-          if (denials && denials !== '0' && denials !== 'unknown') {
+          if (/^[1-9][0-9]*$/.test(denials)) {
             lines.push(
               `The ${denials} refused command(s) are the first thing to check — that is usually the`,
               'agent being unable to run this project\'s tests. Commands are granted in the',
@@ -290,26 +354,10 @@ runs:
             'exists to prevent, so it is reported here rather than left silent.');
 
           // Update our own previous report rather than stacking a new one.
-          // use_sticky_comment above governs the action's comments, not this
-          // one, and a stale "the agent produced nothing" sitting under a run
-          // that later succeeded is exactly the confusion it exists to avoid.
-          const MARKER = '<!-- agentic-workflow:run-report -->';
+          // use_sticky_comment above governs the action's comments, not this one.
           const body = [MARKER, ...lines].join('\n');
-
-          const { data: existing } = await github.rest.issues.listComments({
-            owner: context.repo.owner, repo: context.repo.repo,
-            issue_number: n, per_page: 100,
-          });
-          const mine = existing.find(c => c.body && c.body.includes(MARKER));
-
           if (mine) {
-            await github.rest.issues.updateComment({
-              owner: context.repo.owner, repo: context.repo.repo,
-              comment_id: mine.id, body,
-            });
+            await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
             return;
           }
-          await github.rest.issues.createComment({
-            owner: context.repo.owner, repo: context.repo.repo,
-            issue_number: n, body,
-          });
+          await github.rest.issues.createComment({ owner, repo, issue_number: n, body });

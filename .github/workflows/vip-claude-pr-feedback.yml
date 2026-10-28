@@ -1,3 +1,4 @@
+# vip-template-version: 2
 # Lets a human revise an OPEN pull request by mentioning the agent in a comment.
 #
 # The rest of the template is one-shot per issue (the human reviews the PR and either
