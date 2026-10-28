@@ -1,3 +1,4 @@
+# vip-template-version: 2
 # Listens for '/approve-plan' comments on issues and implements the approved plan.
 #
 # This workflow is part of the vip-complexity:high flow:
@@ -22,30 +23,75 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+  # The prompt tail every agent gets, whichever provider runs. Security-critical
+  # rules belong here, never in AGENTS.md: a repository's own AGENTS.md replaces
+  # ours, and must not be able to remove them.
+  VIP_PROMPT_CORE: |
+    WRITING GITHUB ACTIONS WORKFLOW FILES:
+
+    Write every run: as a block scalar (run: |) by default. In a plain
+    run: line, a colon followed by a space is parsed as a mapping and the
+    whole file stops being valid YAML. Quoting does not save you — the
+    outer scalar is still plain:
+
+        run: echo $(( x > 0 ? 1 : 0 ))     # breaks
+        run: git commit -m "fix: thing"    # breaks too
+
+        run: |                             # fine
+          git commit -m "fix: thing"
+
+    GitHub cannot schedule a job from a file it could not read, so the
+    run ends in seconds with no jobs and no log. That reads as broken
+    code rather than broken YAML.
+
+    If this repository depends on code you cannot read from here — a private
+    dependency, an API you cannot reach — do NOT guess its contract. Do what you
+    can, and state the unverified assumption plainly where a reviewer will read
+    it: in the plan when planning, in the PR body when implementing. A confident
+    change built on a guessed interface passes review and fails in production.
+  # Claude opens its own pull request; the other providers hand their changes to
+  # vip-agent-publish.yml, which validates them instead.
+  VIP_PROMPT_CLAUDE_PUBLISH: |
+    Before opening the PR, if you added or changed anything under
+    .github/workflows/, run:
+
+        bash scripts/vip-validate-workflows.sh
+
+    Fix what it reports and run it again. Do not open the PR while it
+    is failing.
+
+# Concurrency is declared per job, not here. Every issue comment starts this
+# workflow, and GitHub keeps one pending run per group: a workflow-level group
+# let an unrelated comment cancel a pending /approve-plan run, or a label run
+# queued in vip-agent-ready-trigger.yml under the same group. Only the jobs that
+# run for an /approve-plan comment join `agent-ready-<issue>`, so the gate waits
+# behind a label run on the same issue and never displaces it.
+
 jobs:
-  handle-approve-plan:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # PREFLIGHT
+  # Who approved, and whether an implementation is already open. Its own job so
+  # every provider shares it and the agent jobs hold only the scope they need.
+  # ─────────────────────────────────────────────────────────────────────────────
+  preflight:
     # Only fire on /approve-plan comments (not PR comments, not other content)
     if: |
       github.event.issue.pull_request == null &&
       startsWith(github.event.comment.body, '/approve-plan')
+    concurrency:
+      group: agent-ready-${{ github.event.issue.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
       issues: write
-      id-token: write
-      actions: read
+      pull-requests: read
+    outputs:
+      proceed: ${{ steps.verdict.outputs.proceed }}
+      base_sha: ${{ steps.verdict.outputs.base_sha }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # The plan is committed to plan/issue-<N> and never merged, so a default
-          # checkout of the base branch has no docs/plans/ at all. Fetch everything
-          # so the plan branch is present locally.
-          fetch-depth: 0
-
       - name: Check commenter permissions
         id: permission-check
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -81,6 +127,7 @@ jobs:
 
             core.setOutput('allowed', allowed ? 'true' : 'false');
 
+      # The same match the trigger uses: case-insensitive, and includes "resolves".
       - name: Check for existing PR (idempotency)
         id: pr-check
         if: steps.permission-check.outputs.allowed == 'true'
@@ -91,17 +138,11 @@ jobs:
             const { data: prs } = await github.rest.pulls.list({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              state: 'open'
+              state: 'open',
+              per_page: 100,
             });
-
-            // Check if any open PR references this issue
             const existing = prs.find(pr =>
-              pr.body && (
-                pr.body.includes(`Closes #${issueNumber}`) ||
-                pr.body.includes(`closes #${issueNumber}`) ||
-                pr.body.includes(`Fixes #${issueNumber}`) ||
-                pr.body.includes(`fixes #${issueNumber}`)
-              )
+              pr.body && new RegExp(`(closes|fixes|resolves)\\s+#${issueNumber}\\b`, 'i').test(pr.body)
             );
 
             if (existing) {
@@ -116,12 +157,71 @@ jobs:
               core.setOutput('already_running', 'false');
             }
 
+      - name: Decide
+        id: verdict
+        env:
+          ALLOWED: ${{ steps.permission-check.outputs.allowed }}
+          ALREADY: ${{ steps.pr-check.outputs.already_running }}
+          BASE_SHA: ${{ github.sha }}
+        run: |
+          proceed=false
+          if [[ "$ALLOWED" == "true" && "$ALREADY" == "false" ]]; then proceed=true; fi
+          echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Preflight: proceed=$proceed"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CLAUDE (default)
+  # ─────────────────────────────────────────────────────────────────────────────
+  implement-claude:
+    needs: preflight
+    if: |
+      needs.preflight.outputs.proceed == 'true' &&
+      (vars.AGENT_PROVIDER == 'claude' || vars.AGENT_PROVIDER == '')
+    concurrency:
+      group: agent-ready-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+
+    steps:
+      # Preflight looked before this job queued. Two /approve-plan comments a few
+      # seconds apart both pass it, and the second's job runs as soon as the
+      # first finishes — by which time the first has opened its pull request.
+      - name: Check again for an existing PR
+        id: recheck
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const n = context.payload.issue.number;
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100,
+            });
+            const existing = prs.find(pr =>
+              pr.body && new RegExp(`(closes|fixes|resolves)\\s+#${n}\\b`, 'i').test(pr.body));
+            if (existing) console.log(`Opened while this job was queued: ${existing.html_url} — skipping.`);
+            core.setOutput('already_running', existing ? 'true' : 'false');
+
+      - name: Checkout
+        if: steps.recheck.outputs.already_running == 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The plan is committed to plan/issue-<N> and never merged, so a default
+          # checkout of the base branch has no docs/plans/ at all. Fetch everything
+          # so the plan branch is present locally.
+          fetch-depth: 0
+
       - name: Run Claude Code — implement the approved plan
-        if: |
-          steps.permission-check.outputs.allowed == 'true' &&
-          steps.pr-check.outputs.already_running == 'false'
+        if: steps.recheck.outputs.already_running == 'false'
         uses: ./.github/actions/vip-claude-run
         with:
+          mode: implement
           oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           debug: ${{ vars.AGENT_DEBUG }}
           report_issue_number: ${{ github.event.issue.number }}
@@ -145,7 +245,8 @@ jobs:
             3. If no plan file exists, say so in a comment on the issue before you
                implement anything — an approved plan that cannot be found is worth
                reporting, not working around silently
-            4. Implement the feature per the plan or issue
+            4. Read AGENTS.md, and CLAUDE.md if it exists, for project-specific guidance,
+               then implement the feature per the plan or issue
             5. Open a PR using the vip-agent-generated PR template
             6. Add the 'vip-agent-generated' label to the PR
 
@@ -154,34 +255,377 @@ jobs:
             - Reference the issue number in the PR: "Closes #${{ github.event.issue.number }}"
             - If blocked or uncertain, comment on the issue asking for clarification
 
+            ${{ env.VIP_PROMPT_CORE }}
 
-            WRITING GITHUB ACTIONS WORKFLOW FILES:
+            ${{ env.VIP_PROMPT_CLAUDE_PUBLISH }}
 
-            Write every run: as a block scalar (run: |) by default. In a plain
-            run: line, a colon followed by a space is parsed as a mapping and the
-            whole file stops being valid YAML. Quoting does not save you — the
-            outer scalar is still plain:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # OPENAI CODEX
+  # Same shape as the trigger's Codex jobs (see vip-agent-ready-trigger.yml), with
+  # the approved plan copied into the workspace before the agent starts.
+  # ─────────────────────────────────────────────────────────────────────────────
+  implement-codex-agent:
+    needs: preflight
+    if: needs.preflight.outputs.proceed == 'true' && vars.AGENT_PROVIDER == 'openai-codex'
+    concurrency:
+      group: agent-ready-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      plan_path: ${{ steps.plan.outputs.path }}
 
-                run: echo $(( x > 0 ? 1 : 0 ))     # breaks
-                run: git commit -m "fix: thing"    # breaks too
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.base_sha }}
+          # The plan lives on plan/issue-<N>, which is never merged.
+          fetch-depth: 0
+          persist-credentials: false
 
-                run: |                             # fine
-                  git commit -m "fix: thing"
+      # Copied in before the agent runs, so the agent reads it rather than
+      # fetching it, and so publish can tell "only the plan changed" from work.
+      - name: Stage the approved plan
+        id: plan
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+          BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
+        run: |
+          ref="refs/remotes/origin/plan/issue-${ISSUE}"
+          if ! git rev-parse --verify -q "$ref" >/dev/null; then
+            echo "No plan/issue-${ISSUE} branch; the agent works from the issue alone."
+            exit 0
+          fi
+          path="$(git diff --name-only --diff-filter=A "$BASE_SHA" "$ref" -- docs/plans/ | grep '\.md$' | tail -1 || true)"
+          if [[ -z "$path" ]]; then
+            echo "plan/issue-${ISSUE} adds no plan file; the agent works from the issue alone."
+            exit 0
+          fi
+          mkdir -p "$(dirname -- "$path")"
+          git show "$ref:$path" > "$path"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "Staged $path"
 
-            GitHub cannot schedule a job from a file it could not read, so the
-            run ends in seconds with no jobs and no log. That reads as broken
-            code rather than broken YAML.
+      - name: Remove repository agent settings and env files
+        run: |
+          find . -path ./.git -prune -o \( -name '.env*' -o -name .codex -o -name .agents -o -name .gemini \) -prune -print0 \
+            | xargs -0 -r rm -rf --
 
-            Before opening the PR, if you added or changed anything under
-            .github/workflows/, run:
+      - name: Prepare the Codex run
+        id: setup
+        uses: ./.github/actions/vip-codex-run
+        with:
+          mode: implement
+          issue_number: ${{ github.event.issue.number }}
+          issue_title: ${{ github.event.issue.title }}
+          issue_body: ${{ github.event.issue.body }}
+          plan_path: ${{ steps.plan.outputs.path }}
+          tail: ${{ env.VIP_PROMPT_CORE }}
 
-                bash scripts/vip-validate-workflows.sh
+      - name: Codex
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          codex-version: '0.163.0'
+          codex-home: ${{ steps.setup.outputs.codex_home }}
+          prompt-file: ${{ steps.setup.outputs.prompt_file }}
+          output-file: ${{ steps.setup.outputs.final_message_file }}
+          permission-profile: ':workspace'
+          safety-strategy: drop-sudo
 
-            Fix what it reports and run it again. Do not open the PR while it
-            is failing.
+      - name: Snapshot the workspace
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin HOME=/tmp /usr/bin/bash --noprofile --norc -eo pipefail {0}
+        run: |
+          out='${{ runner.temp }}/vip-agent-out'
+          mkdir -p "$out"
+          tar --anchored --exclude=./.git -C '${{ github.workspace }}' -czf "$out/snapshot.tgz" .
+          rm -rf '${{ github.workspace }}/.git'
 
-            If this repository depends on code you cannot read from here — a private
-            dependency, an API you cannot reach — do NOT guess its contract. Implement
-            what you can, and state the unverified assumption plainly in the PR body (or
-            in the plan) so a reviewer can check it. A confident PR built on a guessed
-            interface passes review and fails in production.
+      - name: Upload the snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vip-agent-snapshot
+          path: ${{ runner.temp }}/vip-agent-out
+          retention-days: 1
+          # The snapshot is already gzipped.
+          compression-level: 0
+
+  implement-codex-publish:
+    needs: [preflight, implement-codex-agent]
+    if: always() && needs.preflight.outputs.proceed == 'true' && vars.AGENT_PROVIDER == 'openai-codex'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    uses: ./.github/workflows/vip-agent-publish.yml
+    with:
+      mode: implement
+      provider: openai-codex
+      issue_number: ${{ format('{0}', github.event.issue.number) }}
+      base_sha: ${{ needs.preflight.outputs.base_sha }}
+      plan_path: ${{ needs.implement-codex-agent.outputs.plan_path }}
+      agent_result: ${{ needs.implement-codex-agent.result }}
+      agent_job: implement-codex-agent
+    secrets:
+      publish_token: ${{ secrets.VIP_AGENT_PUBLISH_TOKEN }}
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # GEMINI
+  # Gemini edits files with file tools only: no shell, no web. A separate job
+  # scans its output for its API key, and vip-agent-publish.yml validates and
+  # publishes what it changed. From the agent step on, this job is treated as
+  # compromised, as for Codex. The approved plan is staged before the agent runs.
+  # ─────────────────────────────────────────────────────────────────────────────
+  implement-gemini-agent:
+    needs: preflight
+    if: needs.preflight.outputs.proceed == 'true' && vars.AGENT_PROVIDER == 'gemini'
+    concurrency:
+      group: agent-ready-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      plan_path: ${{ steps.plan.outputs.path }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.base_sha }}
+          # The plan lives on plan/issue-<N>, which is never merged.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Stage the approved plan
+        id: plan
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+          BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
+        run: |
+          ref="refs/remotes/origin/plan/issue-${ISSUE}"
+          if ! git rev-parse --verify -q "$ref" >/dev/null; then
+            echo "No plan/issue-${ISSUE} branch; the agent works from the issue alone."
+            exit 0
+          fi
+          path="$(git diff --name-only --diff-filter=A "$BASE_SHA" "$ref" -- docs/plans/ | grep '\.md$' | tail -1 || true)"
+          if [[ -z "$path" ]]; then
+            echo "plan/issue-${ISSUE} adds no plan file; the agent works from the issue alone."
+            exit 0
+          fi
+          mkdir -p "$(dirname -- "$path")"
+          git show "$ref:$path" > "$path"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "Staged $path"
+
+      # Files that would steer the agent or its tools from inside the repository.
+      # Gemini trusts the workspace (the action requires it), so a repository
+      # .gemini/settings.json or .env would otherwise be honoured.
+      - name: Remove repository agent settings and env files
+        run: |
+          find . -path ./.git -prune -o \( -name '.env*' -o -name .codex -o -name .agents -o -name .gemini \) -prune -print0 \
+            | xargs -0 -r rm -rf --
+
+      - name: Prepare the Gemini run
+        id: setup
+        uses: ./.github/actions/vip-gemini-run
+        with:
+          mode: implement
+          issue_number: ${{ github.event.issue.number }}
+          issue_title: ${{ github.event.issue.title }}
+          issue_body: ${{ github.event.issue.body }}
+          plan_path: ${{ steps.plan.outputs.path }}
+          tail: ${{ env.VIP_PROMPT_CORE }}
+
+      - name: Gemini
+        uses: google-github-actions/run-gemini-cli@f77273f4c914e4bf38440cf36a0369cb64a37489 # v0.1.22
+        env:
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_cli_version: '0.65.0'
+          settings: ${{ steps.setup.outputs.settings }}
+          prompt: ${{ steps.setup.outputs.prompt }}
+
+      # Untrusted from here on: an empty environment, no secrets, no git.
+      - name: Snapshot the workspace
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin HOME=/tmp /usr/bin/bash --noprofile --norc -eo pipefail {0}
+        run: |
+          w='${{ github.workspace }}'
+          out='${{ runner.temp }}/vip-agent-out'
+          mkdir -p "$out"
+          log="$w/gemini-artifacts/stdout.log"
+          if [[ -s "$log" ]]; then
+            jq -r '.response // ""' "$log" > "$out/final-message.md" 2>/dev/null || true
+            jq '{turns: ([.stats.models[]?.roles.main.totalRequests // 0] | add // 0),
+                 tokens: ([.stats.models[]?.tokens.total // 0] | add // 0),
+                 tool_failures: (.stats.tools.totalFail // 0)}' "$log" > "$out/metrics.json" 2>/dev/null || true
+          fi
+          tar --anchored --exclude=./.git --exclude=./gemini-artifacts -C "$w" -czf "$out/snapshot.tgz" .
+          rm -rf "$w/.git"
+
+      - name: Upload the snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vip-agent-snapshot
+          path: ${{ runner.temp }}/vip-agent-out
+          retention-days: 1
+          # The snapshot is already gzipped.
+          compression-level: 0
+
+  # Gemini's key is in its own environment, so the snapshot and its final
+  # message are checked for the key's literal value on a fresh runner before
+  # anything is published. The only job besides the agent that holds the key.
+  implement-gemini-keyscan:
+    needs: [preflight, implement-gemini-agent]
+    if: needs.implement-gemini-agent.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      result: ${{ steps.scan.outputs.result }}
+    steps:
+      - name: Download the snapshot
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vip-agent-snapshot
+          path: ${{ runner.temp }}/scan
+
+      - name: Look for the key
+        id: scan
+        env:
+          KEY: ${{ secrets.GEMINI_API_KEY }}
+          DIR: ${{ runner.temp }}/scan
+        run: |
+          result=fail
+          if [[ -n "$KEY" ]]; then
+            hits="$( { zcat "$DIR/snapshot.tgz"; find "$DIR" -type f ! -name snapshot.tgz -exec cat {} +; } | grep -acF -- "$KEY" || true)"
+            [[ "$hits" == "0" ]] && result=pass
+          fi
+          echo "Key scan: $result"
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+
+  implement-gemini-publish:
+    needs: [preflight, implement-gemini-agent, implement-gemini-keyscan]
+    if: always() && needs.preflight.outputs.proceed == 'true' && vars.AGENT_PROVIDER == 'gemini'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    uses: ./.github/workflows/vip-agent-publish.yml
+    with:
+      mode: implement
+      provider: gemini
+      issue_number: ${{ format('{0}', github.event.issue.number) }}
+      base_sha: ${{ needs.preflight.outputs.base_sha }}
+      plan_path: ${{ needs.implement-gemini-agent.outputs.plan_path }}
+      agent_result: ${{ needs.implement-gemini-agent.result }}
+      agent_job: implement-gemini-agent
+      key_scan_result: ${{ needs.implement-gemini-keyscan.outputs.result || needs.implement-gemini-keyscan.result }}
+    secrets:
+      publish_token: ${{ secrets.VIP_AGENT_PUBLISH_TOKEN }}
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # COPILOT (stub) and CUSTOM (dispatch)
+  # ─────────────────────────────────────────────────────────────────────────────
+  implement-copilot:
+    needs: preflight
+    if: needs.preflight.outputs.proceed == 'true' && vars.AGENT_PROVIDER == 'copilot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Report that this provider is not implemented
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: [
+                '### The approved plan was not implemented',
+                '',
+                '`AGENT_PROVIDER` is set to `copilot`, which is a stub in this template: it',
+                'does not run an agent. Set `AGENT_PROVIDER` to an implemented provider and',
+                'comment `/approve-plan` again.'
+              ].join('\n')
+            });
+            core.setFailed('AGENT_PROVIDER=copilot is a stub; no agent ran.');
+
+  implement-custom:
+    needs: preflight
+    if: needs.preflight.outputs.proceed == 'true' && vars.AGENT_PROVIDER == 'custom'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: Dispatch vip-approve-plan event
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'vip-approve-plan',
+              client_payload: {
+                issue_number: context.payload.issue.number,
+                issue_url: context.payload.issue.html_url,
+                plan_branch: `plan/issue-${context.payload.issue.number}`,
+              }
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: 'Dispatched a `repository_dispatch` event of type `vip-approve-plan`. This template does not implement the agent for `AGENT_PROVIDER=custom`; your listener in this repository picks it up.'
+            });
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # UNKNOWN PROVIDER
+  # ─────────────────────────────────────────────────────────────────────────────
+  implement-unknown-provider:
+    needs: preflight
+    if: |
+      needs.preflight.outputs.proceed == 'true' &&
+      !contains(fromJSON('["", "claude", "openai-codex", "gemini", "copilot", "custom"]'), vars.AGENT_PROVIDER)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Report the unrecognised provider
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PROVIDER: ${{ vars.AGENT_PROVIDER }}
+        with:
+          script: |
+            const provider = process.env.PROVIDER;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: [
+                '### The approved plan was not implemented',
+                '',
+                '`AGENT_PROVIDER` is set to a value this template does not recognise:',
+                '',
+                '```',
+                provider,
+                '```',
+                '',
+                'Valid values: `claude` (the default when unset), `openai-codex`, `gemini`, `copilot`, `custom`.',
+                'Change it in **Settings → Secrets and variables → Actions → Variables**, then',
+                'comment `/approve-plan` again.'
+              ].join('\n')
+            });
+            core.setFailed(`AGENT_PROVIDER=${provider} is not a recognised provider.`);

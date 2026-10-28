@@ -1,3 +1,4 @@
+# vip-template-version: 2
 # Scans open issues for agent-readiness candidates.
 # Runs weekly and on manual dispatch.
 #
