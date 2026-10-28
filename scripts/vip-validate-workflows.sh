@@ -217,3 +217,33 @@ check_timeouts() {
 }
 
 check_timeouts || exit 1
+
+# ── Composite action contexts ─────────────────────────────────────────────────
+# A composite action cannot read the `vars` or `secrets` contexts. Unlike most
+# mistakes, this one is not a runtime warning: GitHub refuses to load the whole
+# action ("Unrecognized named-value: 'vars'"), so every agent run fails before
+# the agent starts. It shipped once — `show_full_output: ${{ vars.AGENT_DEBUG }}`
+# in vip-claude-run — and broke every Claude run. Pass these in as inputs.
+
+check_action_contexts() {
+  local bad=0 f hits
+  while IFS= read -r f; do
+    hits="$(grep -nE '\$\{\{[^}]*\b(vars|secrets)\.' "$f" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+    if [[ -n "$hits" ]]; then
+      red "  vars/secrets context in composite action $f:"
+      printf '%s\n' "$hits" | sed 's/^/      /'
+      bad=1
+    fi
+  done < <(find .github/actions -mindepth 2 -maxdepth 2 -type f -name 'action.yml' 2>/dev/null | sort)
+
+  if [[ "$bad" -gt 0 ]]; then
+    echo ""
+    red "Composite actions cannot read vars or secrets; GitHub fails to load the"
+    red "action at all. Add an input and have each caller pass the value."
+    return 1
+  fi
+  green "No composite action reads the vars or secrets context."
+  return 0
+}
+
+check_action_contexts || exit 1

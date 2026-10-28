@@ -18,8 +18,11 @@ description: >-
 # ignored, which is worse than duplicating it. scripts/vip-validate-workflows.sh
 # checks the job-level values still agree.
 #
-# Credentials arrive as inputs because a composite action cannot read the
-# `secrets` context. Callers pass `${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}`.
+# Credentials and settings arrive as inputs because a composite action cannot
+# read the `secrets` or `vars` contexts. Callers pass
+# `${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}` and `${{ vars.AGENT_DEBUG }}`. A `vars`
+# reference here fails the whole action at load time, before Claude starts;
+# scripts/vip-validate-workflows.sh rejects one.
 
 inputs:
   oauth_token:
@@ -51,6 +54,10 @@ inputs:
     description: "Token used to post the do-nothing comment. Required with report_issue_number."
     required: false
     default: ""
+  debug:
+    description: "Set to 'true' to stream the full SDK output to the job log. Callers pass `vars.AGENT_DEBUG`."
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -89,7 +96,7 @@ runs:
         # GitHub's own debug logging does not reveal SDK output — that was
         # tested, and the re-run returned nothing. Turn it on for one run in a
         # non-sensitive repo, read the log, turn it off.
-        show_full_output: ${{ vars.AGENT_DEBUG == 'true' }}
+        show_full_output: ${{ inputs.debug == 'true' }}
 
         # ADD YOUR PROJECT'S TEST AND LINT COMMANDS TO `allow` BELOW.
         #
